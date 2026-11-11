@@ -61,6 +61,10 @@ nifty200) uses that index's constituents instead: fewer, more liquid stocks
 and a much faster scan. Every chart is read from Zerodha Kite (NSE by default); for the BSE
 listing write the symbol with `.BO`, like `RELIANCE.BO`.
 
+Price cap: with `"min_shares": N` in `trader/config.json` (or `--max-price P`),
+matches priced above `max_order_inr / N` are left out and counted in one line,
+so the list only holds stocks you can buy at least N whole shares of.
+
 Liquidity floors for India: `--min-price` ₹50 and `--min-volume` 200,000
 shares a day by default. Penny stocks and thin SME counters are easy to move
 and often sit at their circuit limits: keep the floors unless the user asks.

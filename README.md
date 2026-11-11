@@ -51,6 +51,7 @@ folder in Applications, or `export SSL_CERT_FILE=/etc/ssl/cert.pem`.
 | `/trader-budget` | Sizes in whole shares to your budget and ₹ max loss, with charges |
 | `/trader-risk` | Checks every order against your ₹ limits and NSE/BSE rules |
 | `/trader-broker` | Order tickets, paper by default, never without your yes |
+| `/trader-journal` | Logs every signal, taken or skipped, and scores it in R after charges |
 | `/trader-alerts` | Stop, target, flat-by 3:15 PM, NSE opening bell |
 | `/trader-analyst` | Reported quarters: revenue, profit, margins, EPS, YoY / QoQ |
 | `/trader-insider` | NSE bulk deals and block deals |

@@ -699,6 +699,26 @@ def money(x):
     return "₹{:,.2f}".format(x)
 
 
+def price_cap(a, cfg):
+    """The highest share price worth listing: --max-price, else the config's order cap divided by
+    min_shares (so at least that many whole shares fit). None = no cap."""
+    if getattr(a, "max_price", None):
+        return float(a.max_price), "--max-price"
+    try:
+        n = int(cfg.get("min_shares") or 0)
+        cap = float(cfg.get("max_order_inr") or 0)
+    except (TypeError, ValueError):
+        return None, ""
+    if n >= 1 and cap > 0:
+        return cap / n, "config: %d share%s inside the ₹%s order cap" % (n, "" if n == 1 else "s", "{:,.0f}".format(cap))
+    return None, ""
+
+
+def apply_price_cap(hits, cap):
+    kept = [h for h in hits if h["price"] <= cap]
+    return kept, len(hits) - len(kept)
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_universe(a):
@@ -757,6 +777,10 @@ def cmd_daily(a):
         local = to_ist(now)
         data, failed = fetch_candles(symbols, "1d", local - datetime.timedelta(days=150), local, a)
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    cap, cap_why = price_cap(a, read_config(a.config))
+    too_dear = 0
+    if cap:
+        hits, too_dear = apply_price_cap(hits, cap)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
@@ -782,6 +806,8 @@ def cmd_daily(a):
                            "{:,}".format(a.min_volume),
                            (", %d had under %d days" % (counts["short"], MIN_DAILY_BARS)) if counts["short"] else "",
                            "{:,}".format(counts["scanned"])))
+    if too_dear:
+        print("Left out %d match%s priced above %s (%s)." % (too_dear, "" if too_dear == 1 else "es", money(cap), cap_why))
     if hits:
         per = [(k, sum(1 for h in hits if k in h["setups"])) for k, _ in SETUPS]
         print("%d chart%s matched a setup: %s." % (len(hits), "" if len(hits) == 1 else "s",
@@ -830,6 +856,10 @@ def cmd_orb(a):
                  % ("{:,}".format(len(symbols)), int(len(symbols) * kite.HIST_GAP) + 1))
         data, failed = fetch_candles(symbols, "5m", datetime.datetime.combine(day, OPEN), cutoff, a)
     hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume)
+    cap, cap_why = price_cap(a, cfg)
+    too_dear = 0
+    if cap:
+        hits, too_dear = apply_price_cap(hits, cap)
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
@@ -855,6 +885,8 @@ def cmd_orb(a):
              "{:,}".format(counts["scanned"]),
              (" (%s under the price / volume floor)" % "{:,}".format(counts["illiquid"])) if counts["illiquid"] else "",
              "{:,}".format(counts["candidates"]), "{:,}".format(counts["confirmed"])))
+    if too_dear:
+        print("Left out %d breakout%s priced above %s (%s)." % (too_dear, "" if too_dear == 1 else "s", money(cap), cap_why))
     if hits:
         print("%d of %s charts closed above their opening-range high by %s:"
               % (len(hits), "{:,}".format(counts["scanned"]), clock_label(cutoff)))
@@ -895,6 +927,9 @@ def main(argv=None):
         p.add_argument("--limit", type=int, help="scan only the first N symbols")
         p.add_argument("--min-price", type=float, default=min_price)
         p.add_argument("--min-volume", type=int, default=min_volume)
+        p.add_argument("--max-price", type=float,
+                       help="leave out stocks above this price (default: config max_order_inr / min_shares)")
+        p.add_argument("--config", default="trader/config.json")
         p.add_argument("--offline", metavar="PATH", help="saved Kite candles (folder or bundle) instead of the network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" IST, or ...Z)')
         p.add_argument("--out", default="trader/watchlist.json")
@@ -910,7 +945,6 @@ def main(argv=None):
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--at", help="cut the clock at this IST, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 14:45)")
-    p.add_argument("--config", default="trader/config.json")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

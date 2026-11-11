@@ -43,6 +43,29 @@ Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (saved Kite candles `{"candles": [...]}`, `.json` or `.json.gz`),
 `--now "2026-11-11 10:20"` (IST) to pin the clock.
 
+## The backtest (the whole rule set, day by day)
+
+`backtest.py` answers a different question from a replay: not "this one trade"
+but "would these rules have made money". It runs the live code (trader-entry's
+trigger with the volume and VWAP checks, trader-exit's stop and target on the
+tick, the config's sizing, one trade a day, Zerodha's charges) over cached Kite
+history for every symbol in `trader/universe.txt`.
+
+```bash
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" fetch --days 730     # once: candles -> trader/cache/ (needs a Kite session)
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" run                  # the rules in trader/config.json
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" run --stop or-low --daily-setup --max-rsi 75
+python3 "${CLAUDE_SKILL_DIR}/backtest.py" grid                 # 48 variants, each split into two halves
+```
+
+It takes the earliest trigger of the day, fills at the next bar's open plus
+slippage, checks the stop before the target, sells at `flat_by`, and reports
+trades, win rate, average R after charges with its standard error and t,
+net rupees, the worst drawdown and both halves. Say the verdict line as it is
+printed. A negative backtest means do not trade those rules live; a positive
+one is still the past with assumed fills. When a grid was run, say how many
+variants were tried: the best of many is partly luck.
+
 ## What it reads and writes
 
 | file | what |
