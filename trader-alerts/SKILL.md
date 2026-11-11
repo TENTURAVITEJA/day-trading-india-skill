@@ -7,8 +7,8 @@ description: >-
   percent moves from the previous close, any time of day, and NSE
   opening bell, each ringing once so you are not spammed. Knows NSE hours
   (9:15 AM to 3:30 PM IST) with the 2026 trading holidays, works out IST
-  itself, fetches free delayed quotes for NSE/BSE stocks (Yahoo chart JSON,
-  SYMBOL.NS / CODE.BO) one ticker at a time, and writes trader/prices.json for sizing and the
+  itself, fetches live quotes for NSE/BSE stocks from Zerodha Kite (SYMBOL /
+  SYMBOL.BO), every ticker in one request, and writes trader/prices.json for sizing and the
   risk check. Use when the user says "alert me when", "tell me if ADANIENT hits",
   "watch my stop", "watch my trade", "remind me to close by 3:15", "is the
   market open", "when does the market open", "get me a price", or right
@@ -71,18 +71,14 @@ close" at 15:15: Zerodha starts auto squaring-off MIS positions around 15:20.
 
 ## Quotes
 
-- `yahoo` (default): `query2.finance.yahoo.com/v8/finance/chart/<SYMBOL>.NS`, an
-  unofficial free JSON endpoint, one request per ticker, half a second apart.
-  On a 429 it waits and tries once more; on a 429 or a 5xx after that it
-  tries `query1`. It identifies itself as `day-trader-skill-india/2.0`.
-- Stooq has no reliable Indian coverage; use `yahoo`.
-- Free quotes are unofficial, delayed and can lag. They are fine for alerts
-  and for checking a size, not for timing an order. The broker's price is the
-  one that fills. Each price in `trader/prices.json` keeps its quote time, and
-  trader-risk only uses one under 15 minutes old.
-- If both are down, read the price from the broker connector (Kite
-  `get_ltp` or `get_quotes` with `NSE:ADANIENT`) and write it into
-  `trader/prices.json` as `{"as_of": "...Z", "prices": {"ADANIENT": 2752.70}}`.
+- `kite` (the only source): Zerodha Kite Connect `/quote` through
+  `trader-broker/kite.py`, every ticker in one request: last traded price,
+  day open / high / low, previous close and the last trade time. Log in once
+  each trading day (`python3 trader-broker/kite.py login`); without a session
+  the quote step stops with that one line.
+- Kite's price is the last trade. Your fill can still differ, more so in a
+  fast market or a thin stock. Each price in `trader/prices.json` keeps its quote
+  time, and trader-risk only uses one under 15 minutes old.
 
 ## The NSE clock
 

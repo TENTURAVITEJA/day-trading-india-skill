@@ -102,7 +102,8 @@ python3 trader-insider/insider.py bulk
 
 | what | source |
 | --- | --- |
-| Prices, charts, quarterly figures | Yahoo Finance (`SYMBOL.NS`, `SYMBOL.BO`): free, unofficial, can lag or be stale |
+| Prices, quotes, candles (1-min to daily) | Zerodha Kite Connect API through `trader-broker/kite.py` (log in once a day: `python3 trader-broker/kite.py login`). `SYMBOL` = NSE, `SYMBOL.BO` = BSE |
+| Quarterly figures (trader-analyst) | Yahoo Finance fundamentals: Kite has no fundamentals API |
 | Stock lists, announcements, board meetings, bulk / block deals | NSE's published files and RSS feeds (`nsearchives.nseindia.com`) |
 | Headlines | Google News India edition, Economic Times markets feed |
 
@@ -115,8 +116,12 @@ results XBRL and no insider (SEBI PIT) disclosures.
 - **Market hours**: NSE/BSE 9:15 AM to 3:30 PM IST. Only the 2026 trading
   holidays are built in; add 2027 to `NSE_HOLIDAYS` in each tool when NSE
   publishes them.
-- **Yahoo's NSE charts have no reliable bars after 3:15 PM**, so the Time
-  Machine's session is 9:15 to 15:15.
+- **Kite session**: the access token ends around 6 AM IST; every price tool
+  stops with a plain "run kite.py login" until you log in again.
+- **Kite rate limit**: about 3 historical requests a second, one symbol per
+  request, so a Nifty 500 scan takes about 3 minutes and the whole NSE list
+  about 12.
+- **The Time Machine's session is 9:15 to 15:15** (the flat-by time).
 - **Tick sizes**: stops and targets are rounded to the paisa, not to NSE's
   tick size.
 - **BSE**: `SYMBOL.BO` works for prices and charts; the stock list, filings

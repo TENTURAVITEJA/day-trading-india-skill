@@ -15,9 +15,9 @@ session in the data.
     python3 timemachine.py chart --from trader/timemachine.json
 
 How the replays work (same algorithm and random draws as the original pack's sim.py):
-  1. Fetch 60 days of 5-minute bars (Yahoo v8 chart, range=60d interval=5m;
-     one request). Keep only FULL sessions before the plan's date: 72 bars,
-     9:15 to 3:15 IST (Yahoo's NSE feed has no reliable bars after 3:15). Half days, gaps and today are left out.
+  1. Fetch 60 days of 5-minute candles from Zerodha Kite (one historical
+     request). Keep only FULL sessions before the plan's date: 72 bars,
+     9:15 to 3:15 IST (3:15 is the flat-by time). Half days, gaps and today are left out.
   2. The pool: for every bar slot 1..77 of the day, each past session's bar as
      ratios to the previous bar's close: (open, high, low, close) / prev close.
   3. One replay starts at the entry price and walks the rest of the session.
@@ -50,16 +50,17 @@ that breaks even at the plan's target R: 1 / (1 + R), so 50 % at 1R and 33 % at
 Below it: a note when more than 40 % of the replays hit neither (the price at
 --until decides those), and the average R when its sign goes against the lean.
 
-5-minute bars only: Yahoo keeps 60 days of 5-min bars but only about 7 days of
-1-min bars, too few sessions for a fair pool. The run refuses with a plain
+5-minute bars only: the replay pool is built from 60 days of 5-minute
+sessions; 1-minute bars would make a different (noisier) pool. The run refuses with a plain
 message when there are fewer than 20 full sessions or the entry bar is not in
 the data. Same plan, same data and same --seed give the same numbers on any
 machine. A simulation built from the stock's own recent bars is not a
 prediction: earnings, news and halts can do what the last 60 days never did.
 
-Data: https://query2.finance.yahoo.com/v8/finance/chart/<T>?range=60d&interval=5m
-(unofficial and free, can lag; falls back to query1 on 429 or 5xx).
---offline FILE reads a saved chart JSON (.json or .json.gz) instead.
+Data: Zerodha Kite Connect historical candles through trader-broker/kite.py
+(log in once a day:  kite.py login).
+--offline FILE reads saved Kite candles {"candles": [[time, o, h, l, c, v], ...]}
+(.json or .json.gz) instead.
 Times are IST wall-clock; --now "2026-11-11 10:20" pins the clock.
 """
 
@@ -74,17 +75,24 @@ import re
 import statistics
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
+import importlib.util as _ilu
+
+
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("kite", os.path.join(os.path.dirname(here), "trader-broker", "kite.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
 
 UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-PAUSE = 0.5          # seconds between requests: be polite to free endpoints
-BACKOFF = 5.0        # seconds to wait once after a 429
-HOSTS = ("query2", "query1")
+HISTORY_DAYS = 60    # calendar days of 5-minute candles in the replay pool
 INTERVAL = 300       # 5-minute bars, in seconds
-SESSION_BARS = 72    # 9:15 to 15:15 IST in 5-minute bars. Yahoo's NSE feed leaves the
-                     # 15:15-15:30 bars empty on most days, and 15:15 is the flat-by time anyway
+SESSION_BARS = 72    # 9:15 to 15:15 IST in 5-minute bars (15:15 is the flat-by time)
 OPEN_MIN = 9 * 60 + 15
 CLOSE_MIN = 15 * 60 + 15
 MIN_SESSIONS = 20
@@ -104,21 +112,6 @@ EARLY_MIN = 13 * 60
 class TMError(Exception):
     pass
 
-
-def yahoo_symbol(sym):
-    """NSE/BSE symbol -> Yahoo symbol: ADANIENT -> ADANIENT.NS; for BSE write ADANIENT.BO (Yahoo has no numeric scrip codes);
-    an explicit .NS / .BO suffix or an index like ^NSEI is kept as is."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    if s.endswith(".BSE"):
-        return s[:-4] + ".BO"
-    if s.endswith(".NSE"):
-        return s[:-4] + ".NS"
-    return s + ".NS"
-
-
-# ---------------------------------------------------------------- time (copied from trader-alerts)
 
 def ist_offset(utc=None):
     """Hours from UTC for India: always +5:30 (IST has no daylight saving)."""
@@ -180,57 +173,18 @@ def clock24(minutes):
 
 # ---------------------------------------------------------------- data
 
-def chart_url(sym, host="query2"):
-    return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-        host, urllib.parse.quote(yahoo_symbol(sym)))
-
-
-def _sleep(seconds):
-    time.sleep(seconds)
-
-
-def _get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
-
-
 def fetch_chart(sym):
-    """One request for 60 days of 5-min bars. query2 first, one retry after a 429,
-    then query1 on 429 or 5xx."""
-    last = None
-    for n, host in enumerate(HOSTS):
-        if n:
-            _sleep(PAUSE)
-        for attempt in (0, 1):
-            url = chart_url(sym, host)
-            try:
-                return _get(url)
-            except urllib.error.HTTPError as e:
-                last = e.code
-                try:
-                    e.close()
-                except Exception:
-                    pass
-                if e.code == 429 and attempt == 0:
-                    _sleep(BACKOFF)
-                    continue
-                if e.code == 429 or e.code >= 500:
-                    break
-                if e.code == 404:
-                    raise TMError("Yahoo has no chart for %s (HTTP 404): check the ticker" % sym.upper())
-                raise TMError("Yahoo answered HTTP %d for %s" % (e.code, sym.upper()))
-            except urllib.error.URLError as e:
-                raise TMError("could not reach Yahoo: %s" % e.reason)
-            except OSError as e:
-                raise TMError("could not reach Yahoo: %s" % e)
-    if last == 429:
-        raise TMError("Yahoo is rate limiting (HTTP 429). Wait a minute and run it again.")
-    raise TMError("Yahoo answered HTTP %s for %s on both hosts. Try again later." % (last, sym.upper()))
+    """60 days of 5-minute Kite candles -> JSON text {"symbol", "candles": [[IST iso, o, h, l, c, v], ...]}."""
+    try:
+        rows = kite.candles(sym, "5m", days=HISTORY_DAYS)
+    except kite.KiteError as e:
+        raise TMError(str(e))
+    return json.dumps({"symbol": sym.upper(), "interval": "5m",
+                       "candles": [[r["dt"].isoformat(), r["o"], r["h"], r["l"], r["c"], r["v"]] for r in rows]})
 
 
 def read_offline(path, sym):
-    """A saved Yahoo chart file (.json or .json.gz), or a folder holding <SYM>-60d5m.json(.gz)."""
+    """A saved Kite candles file (.json or .json.gz), or a folder holding <SYM>-60d5m.json(.gz)."""
     if os.path.isdir(path):
         for name in ("%s-60d5m.json" % sym.upper(), "%s-60d5m.json.gz" % sym.upper()):
             if os.path.exists(os.path.join(path, name)):
@@ -249,47 +203,47 @@ def read_offline(path, sym):
 
 
 def chart_result(text, sym):
+    """JSON text of Kite candles ({"candles": [...]}, optionally under "data") -> the doc."""
     try:
         data = json.loads(text)
     except ValueError:
-        raise TMError("Yahoo returned something that is not JSON for %s" % sym.upper())
-    chart = data.get("chart") if isinstance(data, dict) else None
-    if not isinstance(chart, dict):
-        raise TMError("Yahoo returned something unexpected for %s" % sym.upper())
-    res = chart.get("result")
-    if not res:
-        err = chart.get("error") or {}
-        raise TMError("Yahoo has no data for %s: %s" % (sym.upper(), err.get("description") or "unknown ticker"))
-    return res[0]
+        raise TMError("the candle data for %s is not JSON" % sym.upper())
+    if isinstance(data, dict) and isinstance(data.get("data"), dict):
+        data = dict(data["data"], **{k: v for k, v in data.items() if k != "data"})
+    if not isinstance(data, dict) or not isinstance(data.get("candles"), list):
+        raise TMError("no Kite candles for %s" % sym.upper())
+    if not data["candles"]:
+        raise TMError("Kite has no 5-minute candles for %s" % sym.upper())
+    return data
+
+
+def _ist_of(text):
+    dt = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = to_ist((dt - dt.utcoffset()).replace(tzinfo=None))
+    return dt
 
 
 def parse_bars(result, now_utc):
-    """Yahoo chart result -> (meta, bars, dropped). Regular-session 5-min bars only,
-    oldest first. Dropped: bars with a missing price, bars off the 5-minute grid
-    (the live tick, e.g. 10:49:45), bars not complete yet (now < start + 5 min,
-    where now is the earlier of --now and the data's own regularMarketTime), and
-    bars outside 9:15 to 15:15 IST."""
-    meta = result.get("meta") or {}
-    stamps = result.get("timestamp") or []
-    q = ((result.get("indicators") or {}).get("quote") or [{}])[0] or {}
-    cols = [q.get(k) or [] for k in ("open", "high", "low", "close", "volume")]
+    """Kite candles -> (meta, bars, dropped). Regular-session 5-min bars only,
+    oldest first. Dropped: bars with a missing price, bars off the 5-minute grid,
+    bars not complete yet (now < start + 5 min), and bars outside 9:15 to 15:15 IST."""
+    meta = {"symbol": result.get("symbol"), "interval": result.get("interval")}
     as_of = now_utc
-    rmt = meta.get("regularMarketTime")
-    if isinstance(rmt, (int, float)) and utc_of(rmt) < as_of:
-        as_of = utc_of(rmt)
     dropped = {"no_price": 0, "off_grid": 0, "not_complete": 0, "outside_hours": 0}
     bars = {}
-    for i, ts in enumerate(stamps):
-        o, h, l, c, v = [col[i] if i < len(col) else None for col in cols]
-        if ts is None or None in (o, h, l, c):
+    for row in result["candles"]:
+        if not row or len(row) < 5 or None in row[1:5]:
             dropped["no_price"] += 1
             continue
-        ts = int(ts)
+        local = _ist_of(row[0])
+        o, h, l, c = row[1:5]
+        v = row[5] if len(row) > 5 else 0
+        start = ist_to_utc(local)
+        ts = int((start - EPOCH).total_seconds())
         if ts % INTERVAL:
             dropped["off_grid"] += 1
             continue
-        start = utc_of(ts)
-        local = to_ist(start)
         mins = local.hour * 60 + local.minute - OPEN_MIN
         if mins < 0 or mins >= SESSION_BARS * 5:
             dropped["outside_hours"] += 1
@@ -533,8 +487,8 @@ def normalize_plan(raw, src="flags"):
         raise TMError("side must be buy or sell, got %r" % raw.get("side"))
     interval = str(raw.get("interval") or "5m")
     if interval != "5m":
-        raise TMError("5-minute bars only (the plan says %s): Yahoo keeps 60 days of 5-min bars but only about "
-                      "7 days of 1-min bars, too few sessions for a fair replay pool" % interval)
+        raise TMError("5-minute bars only (the plan says %s): the replay pool is built from 60 days of "
+                      "5-minute sessions" % interval)
     try:
         date = datetime.date.fromisoformat(str(raw.get("date") or "")).isoformat()
     except ValueError:
@@ -671,7 +625,7 @@ def verdict_notes(mc):
     return notes
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="kite"):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
@@ -681,9 +635,9 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     result = chart_result(text, sym)
     meta, bars, dropped = parse_bars(result, now_utc)
     msym = str(meta.get("symbol") or "").upper()
-    if msym and msym != yahoo_symbol(sym):
+    if msym and msym != sym.upper():
         raise TMError("the data is for %s but the plan is for %s" % (msym, sym))
-    gran = meta.get("dataGranularity")
+    gran = meta.get("interval")
     if gran and gran != "5m":
         raise TMError("the data has %s bars; the time machine needs 5-minute bars" % gran)
     if not bars:
@@ -868,7 +822,7 @@ def compute(a):
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
-        text, source = fetch_chart(plan["symbol"]), "yahoo"
+        text, source = fetch_chart(plan["symbol"]), "kite"
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
 
 
@@ -924,7 +878,7 @@ def main(argv=None):
         p.add_argument("--seed", type=int, default=19)
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 15:15, the flat-by time)")
-        p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
+        p.add_argument("--offline", metavar="FILE", help="saved Kite candles JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-11-11 10:20" IST, or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")

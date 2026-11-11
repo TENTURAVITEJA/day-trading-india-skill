@@ -29,13 +29,13 @@ and a neat plan does not change that.
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan                          # trader/entry.json: midpoint stop, 2R target
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop or-mid --target 1R --write
-python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Yahoo or --offline)
+python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --stop atr:1.5           # needs the session's bars (Kite or --offline)
 python3 "${CLAUDE_SKILL_DIR}/exit.py" plan --symbol ADANIENT --entry 2768.50 --or-high 2746.70 --or-low 2728.80
 python3 "${CLAUDE_SKILL_DIR}/exit.py" show                          # the current trader/plan.json
 ```
 
 Other flags: `--flat-by 15:15`, `--json`, `--now "2026-11-11 10:20"` (IST), `--entry PRICE` with a waiting entry.json to plan ahead, `--setup
-level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop).
+level`, `--offline FILE` (saved Kite candles `{"candles": [...]}` for an ATR stop).
 
 ## What it reads and writes
 
@@ -43,7 +43,7 @@ level`, `--offline FILE` (a saved Yahoo chart JSON for an ATR stop).
 | --- | --- |
 | `trader/entry.json` | the trigger from trader-entry: symbol, entry price, time, bar, opening range |
 | `trader/config.json` | `flat_by` (15:15) and `min_reward_risk` (1.0: a note here, trader-risk enforces it) |
-| Yahoo chart API | only for an `atr:K` stop: the session's bars up to the entry bar, free and unofficial |
+| Zerodha Kite candles | only for an `atr:K` stop: the session's bars up to the entry bar |
 | `trader/plan.json` | with `--write`: entry, stop and its rule, target and its R, risk a share, reward:risk, flat by. trader-timemachine, trader-budget and trader-alerts read it |
 
 ## Stops and targets

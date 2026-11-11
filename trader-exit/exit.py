@@ -16,7 +16,7 @@ Stops (a long's stop rounds DOWN to the cent, away from the entry):
   price:X    your price
   pct:X      X percent under the entry
   atr:K      K times the 14-bar ATR under the entry, on the session's bars up
-             to the entry bar (--offline FILE or Yahoo). With fewer than 14
+             to the entry bar (--offline FILE or Zerodha Kite candles). With fewer than 14
              bars by then it averages all of them and says so.
   A level setup has no opening-range default: give a stop.
 
@@ -46,13 +46,10 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
+import importlib.util as _ilu
 from decimal import Decimal, InvalidOperation, ROUND_FLOOR, ROUND_HALF_UP
 
 UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-BACKOFF = 5.0
-HOSTS = ("query2", "query1")
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"flat_by": "15:15", "min_reward_risk": 1.0}
 ATR_BARS = 14
@@ -90,17 +87,16 @@ class PlanError(Exception):
     pass
 
 
-def yahoo_symbol(sym):
-    """NSE/BSE symbol -> Yahoo symbol: ADANIENT -> ADANIENT.NS; for BSE write ADANIENT.BO (Yahoo has no numeric scrip codes);
-    an explicit .NS / .BO suffix or an index like ^NSEI is kept as is."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    if s.endswith(".BSE"):
-        return s[:-4] + ".BO"
-    if s.endswith(".NSE"):
-        return s[:-4] + ".NS"
-    return s + ".NS"
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("kite", os.path.join(os.path.dirname(here), "trader-broker", "kite.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
 
 
 # ---------------------------------------------------------------- time
@@ -328,53 +324,6 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
 
 # ---------------------------------------------------------------- bars for ATR (same reader as trader-entry)
 
-def _open_url(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
-
-
-def _sleep(seconds):
-    time.sleep(seconds)
-
-
-def yahoo_get(path):
-    """query2 first, query1 on 429 or 5xx; one retry after a pause on 429."""
-    last = "no answer"
-    for host in HOSTS:
-        url = "https://%s.finance.yahoo.com%s" % (host, path)
-        for attempt in (0, 1):
-            try:
-                return _open_url(url)
-            except urllib.error.HTTPError as e:
-                code, body = e.code, None
-                try:
-                    if code == 404:     # Yahoo says why in the body: an unknown ticker
-                        body = e.read().decode("utf-8", "replace")
-                except Exception:
-                    body = None
-                finally:
-                    e.close()
-                if code == 404:
-                    if body:
-                        return body
-                    raise PlanError("Yahoo has no chart at %s (HTTP 404)" % url.split("?")[0])
-                last = "HTTP %d" % code
-                if code == 429 and attempt == 0:
-                    _sleep(BACKOFF)
-                    continue
-                if code == 429 or code >= 500:
-                    break
-                raise PlanError("Yahoo answered HTTP %d for %s" % (code, url.split("?")[0]))
-            except urllib.error.URLError as e:
-                last = "could not connect: %s" % (e.reason,)
-                break
-            except OSError as e:
-                last = "network error: %s" % (e,)
-                break
-    raise PlanError("Yahoo did not answer (%s on query2 and query1): wait a minute and try again" % last)
-
-
 def read_text(path):
     if path.endswith(".gz"):
         with gzip.open(path, "rt", encoding="utf-8") as fh:
@@ -383,53 +332,51 @@ def read_text(path):
         return fh.read()
 
 
+def _unix(ist_dt):
+    return int((ist_to_utc(ist_dt) - EPOCH).total_seconds())
+
+
+def _ist_of(text):
+    dt = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = to_ist((dt - dt.utcoffset()).replace(tzinfo=None))
+    return dt
+
+
 def load_chart(sym, interval, day, offline=None):
-    ysym = yahoo_symbol(sym)
+    """The session's candles from Kite (or saved Kite candles {"candles": [[time, o, h, l, c, v], ...]})."""
     if offline:
         path = offline
         if os.path.isdir(offline):
-            path = os.path.join(offline, ysym + ".json")
+            path = os.path.join(offline, sym.upper() + ".json")
             if not os.path.exists(path):
                 path += ".gz"
         if not os.path.exists(path):
             raise PlanError("no offline file %s" % path)
         try:
-            text = read_text(path)
+            doc = json.loads(read_text(path))
         except (OSError, ValueError) as e:
             raise PlanError("could not read %s: %s" % (path, e))
+        if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
+            doc = doc["data"]
+        if not isinstance(doc, dict) or "candles" not in doc:
+            raise PlanError("%s is not saved Kite candles" % path)
+        rows = [{"dt": _ist_of(r[0]), "h": r[2], "l": r[3], "c": r[4]} for r in doc["candles"]]
+        data_time = doc.get("data_time")
     else:
-        back = (to_ist(utc_now()).date() - day).days
-        rng = "1d" if back <= 0 else "5d" if back <= 6 else "1mo" if back <= 28 else "60d"
-        if interval == "1m" and back > 6:
-            raise PlanError("Yahoo keeps 1-minute bars for about a week")
-        text = yahoo_get("/v8/finance/chart/%s?range=%s&interval=%s" % (ysym, rng, interval))
-    try:
-        data = json.loads(text)
-        res = data["chart"]["result"]
-    except (ValueError, KeyError, TypeError):
-        raise PlanError("Yahoo returned something unexpected for %s" % sym)
-    if not res:
-        err = (data.get("chart") or {}).get("error") or {}
-        raise PlanError("Yahoo has no data for %s: %s" % (sym, err.get("description") or "unknown ticker"))
-    r = res[0] or {}
-    meta = r.get("meta") or {}
-    if str(meta.get("symbol") or ysym).upper() != ysym:
-        raise PlanError("the chart file holds %s, not %s" % (meta.get("symbol"), sym))
-    q = ((r.get("indicators") or {}).get("quote") or [{}])[0] or {}
-
-    def at(key, i):
-        arr = q.get(key) or []
-        return arr[i] if i < len(arr) else None
-
-    bars = []
-    for i, t in enumerate(r.get("timestamp") or []):
-        c = at("close", i)
-        if t is None or c is None:
-            continue
-        h, lo = at("high", i), at("low", i)
-        bars.append({"t": int(t), "h": float(c if h is None else h), "l": float(c if lo is None else lo),
-                     "c": float(c)})
-    return {"bars": bars, "data_time": meta.get("regularMarketTime")}
+        if interval == "1m" and (to_ist(utc_now()).date() - day).days > 55:
+            raise PlanError("Kite serves 1-minute candles for about 60 days")
+        try:
+            rows = kite.candles(sym, interval, frm=datetime.datetime.combine(day, datetime.time(9, 0)),
+                                to=datetime.datetime.combine(day, datetime.time(15, 59)))
+        except kite.KiteError as e:
+            raise PlanError(str(e))
+        data_time = None
+    bars = [{"t": _unix(r["dt"]), "h": float(r["h"]), "l": float(r["l"]), "c": float(r["c"])}
+            for r in rows if r.get("c") is not None]
+    if data_time is None and bars:
+        data_time = bars[-1]["t"] + INTERVALS.get(interval, 300)
+    return {"bars": bars, "data_time": data_time}
 
 
 def session_bars(chart, day, interval, upto_slot=None, now_utc=None):
@@ -704,7 +651,7 @@ def main(argv=None):
     p.add_argument("--target", help="2R (default), 1R, 1.5R, price:X")
     p.add_argument("--flat-by", help="HH:MM IST (default: config flat_by, 15:15)")
     p.add_argument("--config", default="trader/config.json")
-    p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON for an atr stop")
+    p.add_argument("--offline", metavar="PATH", help="saved Kite candles JSON for an atr stop")
     p.add_argument("--now", help='pretend it is this IST, e.g. "2026-11-11 10:20"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")

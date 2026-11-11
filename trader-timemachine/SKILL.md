@@ -40,7 +40,7 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan 
 ```
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
-bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
+bars), `--offline FILE` (saved Kite candles `{"candles": [...]}`, `.json` or `.json.gz`),
 `--now "2026-11-11 10:20"` (IST) to pin the clock.
 
 ## What it reads and writes
@@ -48,7 +48,7 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 | file | what |
 | --- | --- |
 | `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range |
-| Yahoo chart API | one request: 60 days of 5-minute bars (`range=60d&interval=5m`), free and unofficial, can lag |
+| Zerodha Kite candles | one historical request: 60 days of 5-minute candles |
 | `trader/timemachine.json` | with `--write`: `{plan, mc, history}` plus the verdict. `mc` holds the odds, percentiles, the fan-chart bands, 160 sample paths and a 24-bin histogram of the close |
 
 ## How it works
@@ -63,7 +63,7 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
    first, then the target. A bar that touches both counts as the stop.
 3. **10,000 replays** give four odds. Target first. Stop first. Neither,
    which means the trade was still open at `--until` (default 3:15 PM, the
-   flat-by time; Yahoo's NSE data has no reliable bars after that). Green, which means target
+   flat-by time). Green, which means target
    first or above the entry at `--until`.
    R is +1 at a 1R target, -1 at the stop, and otherwise the distance from
    the entry at `--until` divided by the risk. A gap through the stop still
@@ -89,8 +89,8 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 default. Same plan, same data, same seed: the same numbers, on any machine.
 Say the seed with every result so the user can repeat it.
 
-**5-minute bars only.** Yahoo keeps 60 days of 5-min bars but only about 7
-days of 1-min bars, too few sessions for a fair pool. It refuses, in one
+**5-minute bars only.** The replay pool is 60 days of 5-minute sessions;
+1-minute bars would make a different, noisier pool. It refuses, in one
 plain line, when there are fewer than 20 full sessions, when the entry bar is
 not in the data (wrong date, not closed yet, a future day), or when the plan
 does not make sense (a stop above a buy's entry, an entry off the 5-minute
@@ -146,7 +146,7 @@ stops, is small and should not be read as an edge.)
   them, do not rewrite them. Never judge a 2R or 3R plan by target first vs
   stop first alone: the verdict already weighs the target's R.
 - Simulated odds are not predictions and not promises. Say it once, plainly.
-- Free Yahoo data is unofficial and can lag. Bars are 5-minute bars, checked
+- Data is Zerodha Kite's 5-minute candles. Bars are 5-minute bars, checked
   bar by bar, never tick by tick and never real time.
 - Always say the seed, so any run can be repeated.
 - One plan per run. A changed entry, stop, target or date is a new run.

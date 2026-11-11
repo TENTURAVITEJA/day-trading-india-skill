@@ -9,13 +9,13 @@ chart with the opening range, VWAP and moving averages, RSI, the current
 trade plan (entry, stop, target), the Time Machine's odds and the alerts.
 It never places, changes or cancels an order.
 
-Data: Zerodha Kite (live quotes and candles) when you have logged in today
-with trader-broker/kite.py; otherwise Yahoo Finance (free, unofficial, can
-lag). The page says which one it is using. It listens on 127.0.0.1 only.
+Data: Zerodha Kite Connect only (live quotes and historical candles) through
+trader-broker/kite.py. Log in once each trading day:
+    python3 trader-broker/kite.py login
+Without a session the page says so and shows no prices. It listens on 127.0.0.1 only.
 """
 
 import argparse
-import csv
 import datetime
 import importlib.util
 import io
@@ -24,17 +24,13 @@ import os
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 IST = datetime.timedelta(hours=5, minutes=30)
-UA = "day-trader-skill-india/0.1 (python-urllib; personal use)"
-CACHE_DIR = os.path.expanduser("~/.config/day-trader-india")
 DEFAULT_SYMBOLS = ["RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "SBIN", "BHARTIARTL", "ITC", "LT", "AXISBANK"]
 OR_MINUTES = 15
 
@@ -82,48 +78,14 @@ def kite_ok():
         return False
 
 
-_kite_gate = threading.Lock()
-_kite_last = [0.0]
+_kite_gate = threading.Lock()   # kite.candles() spaces its own calls; one caller at a time keeps that true
 
 
-def kite_call(method, path, params=None):
-    """Kite allows about 3 historical requests a second: space the calls out."""
-    with _kite_gate:
-        gap = time.time() - _kite_last[0]
-        if gap < 0.4:
-            time.sleep(0.4 - gap)
-        _kite_last[0] = time.time()
-        try:
-            return kite.call(method, path, params=params)
-        except kite.KiteError as e:
-            raise ApiError(str(e))
-
-
-def instruments():
-    """{NSE symbol: {"token", "tick", "name"}} from Kite's daily instrument dump (cached per day)."""
-    def fetch():
-        day = (datetime.datetime.utcnow() + IST).strftime("%Y%m%d")
-        path = os.path.join(CACHE_DIR, "instruments-NSE-%s.csv" % day)
-        if not os.path.isfile(path):
-            req = urllib.request.Request(kite.API + "/instruments/NSE", headers={
-                "X-Kite-Version": "3", "User-Agent": UA,
-                "Authorization": "token %s:%s" % (kite.keys()[0], kite.access_token())})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                data = r.read()
-            os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
-            for old in os.listdir(CACHE_DIR):
-                if old.startswith("instruments-NSE-"):
-                    os.remove(os.path.join(CACHE_DIR, old))
-            with open(path, "wb") as fh:
-                fh.write(data)
-        out = {}
-        with open(path, encoding="utf-8") as fh:
-            for r in csv.DictReader(fh):
-                if r.get("segment") == "NSE" and r.get("instrument_type") == "EQ":
-                    out[r["tradingsymbol"]] = {"token": r["instrument_token"], "tick": float(r.get("tick_size") or 0.05),
-                                               "name": r.get("name") or ""}
-        return out
-    return cached("instruments", 6 * 3600, fetch)
+def need_kite():
+    try:
+        kite.access_token()
+    except kite.KiteError as e:
+        raise ApiError("%s (the dashboard reads Zerodha Kite only)" % e)
 
 
 def plain(sym):
@@ -131,54 +93,14 @@ def plain(sym):
     return s[:-3] if s.endswith(".NS") else s
 
 
-def candles_kite(sym, tf):
-    ins = instruments().get(plain(sym))
-    if not ins:
-        raise ApiError("%s is not an NSE equity symbol Kite knows" % sym)
-    now = datetime.datetime.utcnow() + IST
-    days, interval = (8, "5minute") if tf == "5m" else (400, "day")
-    frm = (now - datetime.timedelta(days=days)).strftime("%Y-%m-%d 09:00:00")
-    data = kite_call("GET", "/instruments/historical/%s/%s" % (ins["token"], interval),
-                     {"from": frm, "to": now.strftime("%Y-%m-%d %H:%M:%S")})
-    out = []
-    for c in (data or {}).get("candles") or []:
-        ts = datetime.datetime.fromisoformat(c[0])
-        local = ts.replace(tzinfo=None)            # Kite stamps are IST wall clock (+05:30)
-        out.append({"dt": local, "o": c[1], "h": c[2], "l": c[3], "c": c[4], "v": c[5]})
-    return out
-
-
-def candles_yahoo(sym, tf):
-    ysym = alerts.yahoo_symbol(sym)
-    rng, interval = ("5d", "5m") if tf == "5m" else ("2y", "1d")
-    last = None
-    for host in ("query2", "query1"):
-        url = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=%s" % (
-            host, urllib.parse.quote(ysym), rng, interval)
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=25) as r:
-                res = json.loads(r.read().decode())["chart"]["result"][0]
-            break
-        except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError, IndexError) as e:
-            last = e
-    else:
-        raise ApiError("Yahoo has no chart for %s (%s)" % (sym, last))
-    q = res["indicators"]["quote"][0]
-    out = []
-    for i, ts in enumerate(res.get("timestamp") or []):
-        o, h, l, c = q["open"][i], q["high"][i], q["low"][i], q["close"][i]
-        if None in (o, h, l, c):
-            continue
-        out.append({"dt": datetime.datetime.utcfromtimestamp(ts) + IST, "o": o, "h": h, "l": l, "c": c,
-                    "v": q["volume"][i] or 0})
-    return out
-
-
 def candles(sym, tf):
-    if kite_ok() and not plain(sym).endswith(".BO"):
-        return candles_kite(sym, tf), "kite"
-    return candles_yahoo(sym, tf), "yahoo"
+    need_kite()
+    days, interval = (8, "5m") if tf == "5m" else (400, "1d")
+    with _kite_gate:
+        try:
+            return kite.candles(plain(sym), interval, days=days), "kite"
+        except kite.KiteError as e:
+            raise ApiError(str(e))
 
 
 # ---------------------------------------------------------------- indicators
@@ -279,7 +201,7 @@ def chart(sym, tf):
         keep = range(max(0, len(bars) - 130), len(bars))
         hi20 = max(closes[-21:-1]) if len(closes) > 21 else None
         try:
-            setups = scan.find_setups(closes)
+            setups = scan.find_setups(closes)[0]
         except Exception:
             setups = []
         out.update({
@@ -323,30 +245,21 @@ def daily_summary(sym):
 
 def quotes(symbols):
     symbols = [plain(s) for s in symbols if s][:60]
-    out, source = {}, "yahoo"
-    if kite_ok():
-        source = "kite"
-        ins = ["BSE:" + s[:-3] if s.endswith(".BO") else "NSE:" + s for s in symbols]
-        data = kite_call("GET", "/quote", {"i": ins})
-        for s, i in zip(symbols, ins):
-            d = (data or {}).get(i)
-            if not d:
-                continue
-            o = d.get("ohlc") or {}
-            out[s] = {"last": d.get("last_price"), "prev_close": o.get("close"), "high": o.get("high"),
-                      "low": o.get("low"), "volume": d.get("volume"), "time": str(d.get("last_trade_time") or "")[11:19]}
-    else:
-        for s in symbols:
-            try:
-                q = alerts.parse_yahoo(alerts.fetch_yahoo(s), s)
-                out[s] = {"last": q.get("price"), "prev_close": q.get("prev_close"), "high": None, "low": None,
-                          "volume": None, "time": ""}
-            except Exception:
-                continue
-    for q in out.values():
-        if q.get("last") and q.get("prev_close"):
-            q["pct"] = round(100.0 * (q["last"] / q["prev_close"] - 1), 2)
-    return {"source": source, "quotes": out}
+    need_kite()
+    try:
+        data = kite.quotes(symbols)
+    except kite.KiteError as e:
+        raise ApiError(str(e))
+    out = {}
+    for s in symbols:
+        d = data.get(s)
+        if not d:
+            continue
+        out[s] = {"last": d.get("last"), "prev_close": d.get("prev_close"), "high": d.get("high"),
+                  "low": d.get("low"), "volume": d.get("volume"), "time": str(d.get("time") or "")[11:19]}
+        if out[s]["last"] and out[s]["prev_close"]:
+            out[s]["pct"] = round(100.0 * (out[s]["last"] / out[s]["prev_close"] - 1), 2)
+    return {"source": "kite", "quotes": out}
 
 
 # ---------------------------------------------------------------- trader/ files
@@ -427,7 +340,7 @@ def status():
     return {"market": {"open": st["open"], "reason": st["reason"], "now": st["now_ist"], "weekday": st["weekday"],
                        "next_open": st.get("next_open"), "closes": st.get("closes")},
             "kite": {"connected": ok, "user": sess.get("user_name") if ok else None},
-            "source": "kite" if ok else "yahoo"}
+            "source": "kite" if ok else None}
 
 
 # ---------------------------------------------------------------- http
@@ -497,8 +410,8 @@ def main(argv=None):
         print("dashboard: cannot listen on 127.0.0.1:%d (%s)" % (a.port, e), file=sys.stderr)
         return 1
     url = "http://127.0.0.1:%d/" % a.port
-    print("Dashboard: %s   (reading %s; data from %s)" % (url, Handler.folder, "Zerodha Kite" if kite_ok() else
-          "Yahoo: run trader-broker/kite.py login for live Zerodha data"))
+    print("Dashboard: %s   (reading %s; data from Zerodha Kite%s)" % (url, Handler.folder, "" if kite_ok() else
+          ": NOT LOGGED IN, run  python3 trader-broker/kite.py login"))
     print("Ctrl+C to stop.")
     sys.stdout.flush()
     if a.open:

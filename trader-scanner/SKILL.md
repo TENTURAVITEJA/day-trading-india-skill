@@ -8,9 +8,8 @@ description: >-
   runs a pre-market scan of daily closes (20-day closing-high breakout, bull
   flag, reclaimed the 20-day average, oversold, oversold bounce) and an
   intraday opening-range breakout scan on 5-minute bars, then writes
-  trader/watchlist.json for trader-news and trader-entry. Free Yahoo data
-  (SYMBOL.NS),
-  bar by bar. Use when the user says "scan the market", "find me setups",
+  trader/watchlist.json for trader-news and trader-entry. Zerodha Kite
+  candles (through trader-broker/kite.py), bar by bar. Use when the user says "scan the market", "find me setups",
   "what is breaking out", "opening range breakouts", "scan for bull flags",
   "oversold stocks", "pre-market scan", "build my watchlist", "what should I
   look at today", or at the start of a trading day before /trader-news.
@@ -38,9 +37,9 @@ python3 "${CLAUDE_SKILL_DIR}/scan.py" orb --watchlist trader/watchlist.json --js
 ```
 
 Flags: `--min-price 5` and `--min-volume` (daily 1,000,000, orb 0),
-`--or-minutes 15`, `--max-confirm 200` (orb stage 2),
+`--or-minutes 15`,
 `--now "2026-10-19 10:15"` (IST) to pin the clock, `--offline PATH`
-to read saved Yahoo files, `--no-write`, `--show N`, `--json`. Exit code 0
+to read saved Kite candles, `--no-write`, `--show N`, `--json`. Exit code 0
 when the scan found something, 1 when it found nothing or could not run (the
 reason is one plain line).
 
@@ -59,7 +58,7 @@ reason is one plain line).
 rows) and keeps only the **EQ** series: BE/BZ (trade-for-trade) and SME
 series cannot be traded intraday. `--list nifty500` (or nifty50, nifty100,
 nifty200) uses that index's constituents instead: fewer, more liquid stocks
-and a much faster scan. Every chart is read from Yahoo as `SYMBOL.NS`; for the BSE
+and a much faster scan. Every chart is read from Zerodha Kite (NSE by default); for the BSE
 listing write the symbol with `.BO`, like `RELIANCE.BO`.
 
 Liquidity floors for India: `--min-price` ₹50 and `--min-volume` 200,000
@@ -68,14 +67,14 @@ and often sit at their circuit limits: keep the floors unless the user asks.
 
 ## The daily scan (before the open)
 
-Yahoo's spark endpoint returns closes for 20 symbols a request, so the full NSE list (~2,000
-symbols) takes about 100 requests, roughly a minute with the polite pause
-(0.3 s); the Nifty 500 takes 25. Liquidity comes from the spark meta: last price at
-least `--min-price` and last session's volume at least `--min-volume`. Run it
-before the open or after the close: during the session the volume is the
-day's so far, and today's daily bar is left out until 3:30 PM.
+Kite serves one symbol per historical request, about 3 a second, so the
+Nifty 50 takes about 20 seconds, the Nifty 500 about 3 minutes and the full
+NSE list (~2,000 symbols) about 12. Liquidity: the last close at least
+`--min-price` and the last session's volume at least `--min-volume`. Run it
+before the open or after the close: today's daily candle is left out until
+3:30 PM.
 
-The setups are computed from daily closes only (spark has no highs or lows),
+The setups are computed from daily closes only,
 so a closing-high breakout here is not the same as an intraday-high breakout:
 
 | setup | the rule on closes |
@@ -96,36 +95,23 @@ The opening range is the first `--or-minutes` (15) of the session: the 9:15,
 9:35 and 9:40 five-minute bars. A hit is the first completed 5-minute bar
 to CLOSE above the range high, at that bar's close time.
 
-1. Stage 1, every symbol: spark closes of today's 5-minute bars, 20 a
-   request. A chart goes on only if a completed bar after the range closed at
-   or above the highest close of the range. That is a necessary condition
-   (the range high is at least every range close), so no breakout is lost.
-2. Stage 2, each candidate: the v8 chart with real highs and lows, one
-   request each. Range high = the highest high of the range bars, range low =
-   the lowest low. On a strong morning most charts are candidates, so stage 2
-   checks at most `--max-confirm` (200) of them, the most traded first (price
-   times volume so far), and prints PARTIAL with the count it skipped.
-   `--max-confirm 0` checks them all.
-
-Timing, live on Tue Oct 20 2026 (a strong morning): 100 liquid names at
-10:01 AM took 35 seconds (5 spark requests, 70 v8 charts, 51 of 91 usable
-charts broke out). The whole universe at 10:03 AM took about 4 minutes (298
-spark requests, then 200 v8 charts): 2,448 usable charts, 1,782 candidates,
-the 200 most traded checked, 119 of those broke out. For a fast answer, scan
-the daily watchlist or a list of names you trade (`--watchlist`, `--symbols`).
+Each symbol's 5-minute Kite candles come with real highs and lows, one
+request a symbol (about 3 a second). Range high = the highest high of the
+range bars, range low = the lowest low. A whole-market scan takes about 12
+minutes, so for a fast answer scan the daily watchlist or a list of names you
+trade (`--watchlist`, `--symbols`).
 
 A chart is usable only when every 5-minute bar from 9:15 to the cutoff is
-there; a missing bar means a halt or a thin stock. Null closes are dropped,
-a bar off the 5-minute grid (the live tick, like 10:58:07) is dropped, and a
-bar counts only once it is complete (start + 5 minutes). Before 9:35 AM, on a
+there; a missing bar means a halt or a thin stock. A bar counts only once it is complete (start + 5 minutes). Before 9:35 AM, on a
 weekend or NSE holiday, after the close, or after `no_entries_after` (an expired
 setup) it prints one plain line and writes nothing.
 
 ## Data and limits
 
-- Yahoo's chart and spark endpoints are free, unofficial and can lag. Bars are
-  5-minute bars, bar by bar, never tick by tick. query2 first, query1 on a 429
-  or 5xx, one retry after a 5-second wait on a 429.
+- Data is Zerodha Kite Connect's historical candles through
+  trader-broker/kite.py. Log in once each trading day
+  (`python3 trader-broker/kite.py login`); without a session the scan stops
+  with that one line. Bars are 5-minute bars, bar by bar, never tick by tick.
 - Partial results are said as partial: "Fetched 480 of 500 charts (20
   failed or had no data)". Never round a partial scan up to "the whole market".
 - NSE trading holidays for 2026 (NSE circular). Add 2027 to the code when NSE publishes it (usually in December).

@@ -46,7 +46,7 @@ python3 "${CLAUDE_SKILL_DIR}/news.py" --no-filings --json
 | Google News, India edition | `news.google.com/rss/search?q=<Company> share when:2d&hl=en-IN&gl=IN&ceid=IN:en`; a headline is kept only if it names the company or its symbol |
 | NSE corporate announcements | NSE's official RSS feed, `nsearchives.nseindia.com/content/RSS/Online_announcements.xml`: market-wide, roughly the last day of filings, matched to your stocks by company name |
 | Economic Times markets RSS | with `--market` |
-| Yahoo Finance chart (`SYMBOL.NS`) | the last price against yesterday's close (unofficial, can lag) |
+| Zerodha Kite `/quote` (via `trader-broker/kite.py`) | the last price against yesterday's close, the whole watchlist in one request |
 | `trader/state/news.json` | what has been shown (kept 30 days) |
 
 ## The rules

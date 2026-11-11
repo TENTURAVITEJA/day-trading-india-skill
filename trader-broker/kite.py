@@ -259,6 +259,132 @@ def instrument(sym):
     return "NSE:" + s
 
 
+# ---------------------------------------------------------------- market data (shared by every trader-* skill)
+#
+# The one place the skills get prices and candles from. Every other script loads
+# this file and calls instruments() / candles() / quotes(). Kite stamps candles in
+# IST wall-clock time (+05:30); candles() hands back naive IST datetimes.
+
+CACHE_DIR = os.path.dirname(SESSION)
+HIST_GAP = 0.35          # Kite allows 3 historical requests a second
+QUOTE_BATCH = 500        # /quote takes up to 500 instruments a call
+INTERVALS = {"1m": "minute", "3m": "3minute", "5m": "5minute", "10m": "10minute", "15m": "15minute",
+             "30m": "30minute", "60m": "60minute", "1d": "day",
+             "minute": "minute", "5minute": "5minute", "day": "day"}
+MAX_DAYS = {"minute": 60, "3minute": 100, "5minute": 100, "10minute": 100, "15minute": 200,
+            "30minute": 200, "60minute": 400, "day": 2000}   # Kite's per-request span
+_last_hist = [0.0]
+
+
+def _throttle():
+    import time
+    gap = time.time() - _last_hist[0]
+    if gap < HIST_GAP:
+        time.sleep(HIST_GAP - gap)
+    _last_hist[0] = time.time()
+
+
+def instruments(exchange="NSE"):
+    """{tradingsymbol: {"token", "tick", "name", "lot"}} for equities on NSE or BSE,
+    from Kite's instrument dump, downloaded once a day and cached."""
+    day = ist_now().strftime("%Y%m%d")
+    path = os.path.join(CACHE_DIR, "instruments-%s-%s.csv" % (exchange, day))
+    if not os.path.isfile(path):
+        req = urllib.request.Request(API + "/instruments/" + exchange, headers={
+            "X-Kite-Version": "3", "User-Agent": UA,
+            "Authorization": "token %s:%s" % (keys()[0], access_token())})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = r.read()
+        except (urllib.error.URLError, OSError) as e:
+            raise KiteError("could not download Kite's %s instrument list: %s" % (exchange, getattr(e, "reason", e)))
+        os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+        for old in os.listdir(CACHE_DIR):
+            if old.startswith("instruments-%s-" % exchange):
+                os.remove(os.path.join(CACHE_DIR, old))
+        with open(path, "wb") as fh:
+            fh.write(data)
+    import csv
+    out = {}
+    with open(path, encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            if r.get("segment") == exchange and r.get("instrument_type") == "EQ":
+                out[r["tradingsymbol"]] = {"token": int(r["instrument_token"]),
+                                           "tick": float(r.get("tick_size") or 0.05),
+                                           "name": r.get("name") or "", "lot": int(r.get("lot_size") or 1)}
+    return out
+
+
+def split_symbol(sym):
+    """RELIANCE / RELIANCE.NS / NSE:RELIANCE -> ("NSE", "RELIANCE"); RELIANCE.BO / BSE:X -> ("BSE", ...)."""
+    i = instrument(sym)
+    ex, ts = i.split(":", 1)
+    return ex, ts
+
+
+def token(sym):
+    ex, ts = split_symbol(sym)
+    ins = instruments(ex).get(ts)
+    if not ins:
+        raise KiteError("%s is not an %s equity symbol Kite knows" % (ts, ex))
+    return ins["token"]
+
+
+def candles(sym, interval="5m", frm=None, to=None, days=None):
+    """OHLCV candles for one symbol: [{"dt": naive IST datetime, "o","h","l","c","v"}], oldest first.
+    interval: 1m 3m 5m 10m 15m 30m 60m 1d. Give frm/to (IST datetimes or dates) or days back from now.
+    Long spans are split into chunks Kite accepts."""
+    iv = INTERVALS.get(interval)
+    if not iv:
+        raise KiteError("unknown candle interval %s" % interval)
+    now = ist_now()
+    to = to or now
+    if not isinstance(to, datetime.datetime):
+        to = datetime.datetime.combine(to, datetime.time(23, 59, 59))
+    if frm is None:
+        frm = to - datetime.timedelta(days=days or 5)
+    if not isinstance(frm, datetime.datetime):
+        frm = datetime.datetime.combine(frm, datetime.time(0, 0))
+    tok = token(sym)
+    out, start, span = {}, frm, datetime.timedelta(days=MAX_DAYS[iv])
+    while start <= to:
+        end = min(to, start + span)
+        _throttle()
+        data = call("GET", "/instruments/historical/%d/%s" % (tok, iv),
+                    params={"from": start.strftime("%Y-%m-%d %H:%M:%S"), "to": end.strftime("%Y-%m-%d %H:%M:%S")})
+        for c in (data or {}).get("candles") or []:
+            dt = datetime.datetime.fromisoformat(c[0]).replace(tzinfo=None)
+            out[dt] = {"dt": dt, "o": c[1], "h": c[2], "l": c[3], "c": c[4], "v": c[5] or 0}
+        start = end + datetime.timedelta(seconds=1)
+    return [out[k] for k in sorted(out)]
+
+
+def quotes(symbols):
+    """{symbol as given: {"last", "prev_close", "open", "high", "low", "volume", "time", "bid", "ask",
+    "upper_circuit", "lower_circuit"}} from Kite's /quote, 500 a call. Unknown symbols are left out."""
+    syms = [s for s in symbols if s]
+    out = {}
+    for k in range(0, len(syms), QUOTE_BATCH):
+        part = syms[k:k + QUOTE_BATCH]
+        ins = [instrument(s) for s in part]
+        data = call("GET", "/quote", params={"i": ins}) or {}
+        for s, i in zip(part, ins):
+            d = data.get(i)
+            if not d:
+                continue
+            o = d.get("ohlc") or {}
+            depth = d.get("depth") or {}
+            bid = ((depth.get("buy") or [{}])[0] or {}).get("price")
+            ask = ((depth.get("sell") or [{}])[0] or {}).get("price")
+            t = d.get("last_trade_time") or d.get("timestamp")
+            out[s] = {"last": d.get("last_price"), "prev_close": o.get("close"), "open": o.get("open"),
+                      "high": o.get("high"), "low": o.get("low"), "volume": d.get("volume"),
+                      "time": str(t) if t else None, "bid": bid or None, "ask": ask or None,
+                      "upper_circuit": d.get("upper_circuit_limit"), "lower_circuit": d.get("lower_circuit_limit"),
+                      "token": d.get("instrument_token")}
+    return out
+
+
 def cmd_quote(a):
     ins = [instrument(s) for s in a.symbols]
     q = call("GET", "/quote", params={"i": ins})

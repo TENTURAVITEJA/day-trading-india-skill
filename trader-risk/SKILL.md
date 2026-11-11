@@ -148,7 +148,7 @@ though it is after the 14:45 entry cutoff: it is an exit.
 
 - A PASS only means the order is allowed to be shown to the user. It is not a yes.
 - Every number comes from the config, the order, the portfolio, the prices or the broker log.
-- Free Yahoo prices are unofficial and can lag; the broker's price is the one that fills, and a
+- Prices come from Zerodha Kite quotes; the fill can differ from the last trade, and a
   stop can fill worse than its price in a fast market.
 
 ## What it never does

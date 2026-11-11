@@ -140,7 +140,7 @@ a separate config (`--config`) for a long-term split.
 - Never size money the user has not said is for this. Ask for the budget and the max loss.
 - Every number comes from the config, the plan or the prices. Nothing is guessed.
 - No projections: never say what a trade will make. A target is a plan, not a forecast.
-- Free Yahoo prices are unofficial and can lag. The broker's price is the one that fills.
+- Prices come from Zerodha Kite quotes (trader/prices.json). The fill can still differ from the last trade.
 
 ## What it never does
 

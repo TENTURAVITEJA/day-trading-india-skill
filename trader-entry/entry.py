@@ -22,29 +22,31 @@ Setups (v2 plans longs only):
 
 A trigger's time is the trigger bar's CLOSE time (the 10:10 bar closes at
 10:15 AM) and its price is that close, to the cent. Only bars on the interval
-grid count (Yahoo's live tick, e.g. 10:49:45, is dropped) and a bar counts only
+grid count and a bar counts only
 once it has closed: now >= its start + the interval.
 
 Statuses: triggered; waiting (not open yet, range still forming, or no close
 above the level yet); expired (no trigger by no_entries_after, default 14:45;
 on a 1:00 p.m. early close the cutoff moves up three hours with the close);
-no-data (the market is closed today or Yahoo sent no bars).
+no-data (the market is closed today or Kite sent no candles).
 
 trader/config.json (optional): "no_entries_before" (09:30) and
 "no_entries_after" (14:45), IST.
 
 watch wakes just after each bar closes (bars only change then), re-polls every
---every seconds (default 30) while Yahoo has not posted the new bar, prints one
+--every seconds (default 30) while Kite has not posted the new bar, prints one
 line per closed bar and stops on a trigger (exit 0, writes trader/entry.json),
 on expiry, at the close or at --until (exit 1). With --now or --offline it runs
 on a simulated clock and replays the day without sleeping.
 
-Data: Yahoo's free chart JSON (unofficial, can lag, bars not single trades)
-  https://query2.finance.yahoo.com/v8/finance/chart/ADANIENT?range=1d&interval=5m
-  falls back to query1 on HTTP 429 or 5xx; a 429 gets one retry after a pause.
-  --offline PATH reads a saved chart JSON (.json or .json.gz) instead, or
-  PATH/<TICKER>.json when PATH is a folder. Without --now, an offline file is
-  read as of its own time (meta.regularMarketTime).
+Data: Zerodha Kite Connect historical candles (1-minute or 5-minute, real
+  highs and lows) and the live quote for the last trade time and the previous
+  close, through trader-broker/kite.py (log in once a day:  kite.py login).
+  --offline PATH reads saved Kite candles instead: Kite's historical answer
+  {"candles": [[time, o, h, l, c, v], ...]} with optional "prev_close" and
+  "data_time" (unix seconds), as .json or .json.gz, or PATH/<TICKER>.json when
+  PATH is a folder. Without --now, an offline file is read as of its data_time
+  (or its last candle's close).
 
 Exit codes: check 0 = triggered, 1 = anything else or an error. watch 0 on a
 trigger, 1 otherwise. watchlist 0 when at least one symbol triggered.
@@ -58,15 +60,24 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
+import importlib.util as _ilu
+
+
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("kite", os.path.join(os.path.dirname(here), "trader-broker", "kite.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
 
 UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-PAUSE = 0.5      # seconds between requests to the free endpoint
-BACKOFF = 5.0    # seconds before the one retry after an HTTP 429
+PAUSE = 0.35     # seconds between symbols (Kite: 3 historical requests a second)
 GRACE = 2        # seconds after a bar closes before watch asks for it
-SETTLE = 60      # seconds a closed bar may wait for Yahoo's data to catch up
-HOSTS = ("query2", "query1")
+SETTLE = 60      # seconds a closed bar may wait for Kite's candle to catch up
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"no_entries_before": "09:30", "no_entries_after": "14:45"}
 EPOCH = datetime.datetime(1970, 1, 1)
@@ -203,120 +214,47 @@ def next_open(d):
     return None
 
 
-# ---------------------------------------------------------------- Yahoo
+# ---------------------------------------------------------------- Kite
 
-def plain_symbol(ysym):
-    """ADANIENT.NS -> ADANIENT (the name trader/ files use); ADANIENT.BO keeps its .BO."""
-    s = str(ysym).strip().upper()
+def plain_symbol(sym):
+    """ADANIENT.NS / NSE:ADANIENT -> ADANIENT (the name trader/ files use); ADANIENT.BO keeps its .BO."""
+    s = str(sym).strip().upper()
+    if s.startswith("NSE:"):
+        s = s[4:]
+    elif s.startswith("BSE:"):
+        s = s[4:] + ".BO"
     return s[:-3] if s.endswith(".NS") else s
 
 
-def yahoo_symbol(sym):
-    """ADANIENT -> ADANIENT.NS; for BSE write ADANIENT.BO; .NS / .BO / ^index kept."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    return s + ".NS"
+def _unix(ist_dt):
+    return int((ist_to_utc(ist_dt) - datetime.datetime(1970, 1, 1)).total_seconds())
 
 
-def chart_path(sym, rng, interval):
-    return "/v8/finance/chart/%s?range=%s&interval=%s" % (yahoo_symbol(sym), rng, interval)
+def _ist_of(text):
+    """Kite time text ('2026-11-11 15:59:28' IST, or ISO with +05:30) -> naive IST."""
+    dt = datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = to_ist((dt - dt.utcoffset()).replace(tzinfo=None))
+    return dt
 
 
-def chart_range(day, today, interval):
-    """The smallest Yahoo range that still holds the session of `day`."""
-    back = (today - day).days
-    if back <= 0:
-        return "1d"
-    if back <= 6:
-        return "5d"
-    if interval == "1m":
-        raise EntryError("Yahoo keeps 1-minute bars for about a week: use --interval 5m for %s" % day)
-    if back <= 28:
-        return "1mo"
-    if back <= 58:
-        return "60d"
-    raise EntryError("Yahoo keeps 5-minute bars for about 60 days: %s is too far back" % day)
-
-
-def _open_url(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
-
-
-def _sleep(seconds):
-    time.sleep(seconds)
-
-
-def yahoo_get(path):
-    """GET a Yahoo path: query2 first, query1 when query2 answers 429 or 5xx.
-    An HTTP 429 gets one retry on the same host after BACKOFF seconds."""
-    last = "no answer"
-    for host in HOSTS:
-        url = "https://%s.finance.yahoo.com%s" % (host, path)
-        for attempt in (0, 1):
-            try:
-                return _open_url(url)
-            except urllib.error.HTTPError as e:
-                code, body = e.code, None
-                try:
-                    if code == 404:     # Yahoo says why in the body: an unknown ticker
-                        body = e.read().decode("utf-8", "replace")
-                except Exception:
-                    body = None
-                finally:
-                    e.close()
-                if code == 404:
-                    if body:
-                        return body
-                    raise EntryError("Yahoo has no chart at %s (HTTP 404)" % url.split("?")[0])
-                last = "HTTP %d" % code
-                if code == 429 and attempt == 0:
-                    _sleep(BACKOFF)
-                    continue
-                if code == 429 or code >= 500:
-                    break
-                raise EntryError("Yahoo answered HTTP %d for %s" % (code, url.split("?")[0]))
-            except urllib.error.URLError as e:
-                last = "could not connect: %s" % (e.reason,)
-                break
-            except OSError as e:
-                last = "network error: %s" % (e,)
-                break
-    raise EntryError("Yahoo did not answer (%s on query2 and query1): wait a minute and try again" % last)
-
-
-def parse_chart(text, sym):
-    """Yahoo chart JSON v8 -> {symbol, meta, bars, prev_close, data_time}.
-    Bars with a null close are dropped here; off-grid ticks later."""
-    try:
-        data = json.loads(text)
-        res = data["chart"]["result"]
-    except (ValueError, KeyError, TypeError):
-        raise EntryError("Yahoo returned something unexpected for %s" % sym)
-    if not res:
-        err = (data.get("chart") or {}).get("error") or {}
-        raise EntryError("Yahoo has no data for %s: %s" % (sym, err.get("description") or "unknown ticker"))
-    r = res[0] or {}
-    meta = r.get("meta") or {}
-    q = ((r.get("indicators") or {}).get("quote") or [{}])[0] or {}
-
-    def at(key, i):
-        arr = q.get(key) or []
-        return arr[i] if i < len(arr) else None
-
+def chart_from_candles(sym, rows, prev_close=None, data_time=None, interval=None):
+    """Kite candles (kite.candles() dicts or raw [time, o, h, l, c, v]) -> {symbol, meta, bars, prev_close, data_time}."""
     bars = []
-    for i, t in enumerate(r.get("timestamp") or []):
-        c = at("close", i)
-        if t is None or c is None:
+    for r in rows:
+        if isinstance(r, dict):
+            dt, o, h, lo, c, v = r["dt"], r["o"], r["h"], r["l"], r["c"], r["v"]
+        else:
+            dt, o, h, lo, c = _ist_of(r[0]), r[1], r[2], r[3], r[4]
+            v = r[5] if len(r) > 5 else 0
+        if c is None:
             continue
-        o, h, lo = at("open", i), at("high", i), at("low", i)
-        bars.append({"t": int(t), "o": float(c if o is None else o), "h": float(c if h is None else h),
-                     "l": float(c if lo is None else lo), "c": float(c), "v": int(at("volume", i) or 0)})
-    return {"symbol": yahoo_symbol(meta.get("symbol") or sym), "meta": meta, "bars": bars,
-            "prev_close": meta.get("previousClose") or meta.get("chartPreviousClose"),
-            "data_time": meta.get("regularMarketTime")}
+        bars.append({"t": _unix(dt), "o": float(o), "h": float(h), "l": float(lo), "c": float(c), "v": int(v or 0)})
+    bars.sort(key=lambda b: b["t"])
+    if data_time is None and bars:
+        data_time = bars[-1]["t"] + INTERVALS.get(interval or "5m", 300)
+    return {"symbol": plain_symbol(sym), "meta": {"interval": interval}, "bars": bars,
+            "prev_close": prev_close, "data_time": data_time}
 
 
 def read_text(path):
@@ -329,7 +267,7 @@ def read_text(path):
 
 def offline_file(path, sym):
     if os.path.isdir(path):
-        for name in (sym + ".json", sym + ".json.gz", yahoo_symbol(sym) + ".json", yahoo_symbol(sym) + ".json.gz"):
+        for name in (sym + ".json", sym + ".json.gz"):
             p = os.path.join(path, name)
             if os.path.exists(p):
                 return p
@@ -340,24 +278,38 @@ def offline_file(path, sym):
 
 
 def get_chart(sym, interval, day=None, offline=None, today=None):
-    """Bars for one ticker, from Yahoo (range=1d for today) or a saved file."""
+    """Bars for one ticker on `day`, from Kite or a saved file of Kite candles."""
     sym = sym.upper()
     if offline:
         f = offline_file(offline, sym)
         try:
-            text = read_text(f)
+            doc = json.loads(read_text(f))
         except (OSError, ValueError) as e:
             raise EntryError("could not read %s: %s" % (f, e))
-    else:
-        today = today or to_ist(utc_now()).date()
-        text = yahoo_get(chart_path(sym, chart_range(day or today, today, interval), interval))
-    ch = parse_chart(text, sym)
-    if ch["symbol"] != yahoo_symbol(sym):
-        raise EntryError("the chart file holds %s, not %s" % (ch["symbol"], sym))
-    gran = ch["meta"].get("dataGranularity")
-    if gran and gran != interval:
-        raise EntryError("%s has %s bars, not %s: use --interval %s" % (sym, gran, interval, gran))
-    return ch
+        if isinstance(doc, dict) and isinstance(doc.get("data"), dict):
+            doc = dict(doc["data"], **{k: v for k, v in doc.items() if k != "data"})
+        if not isinstance(doc, dict) or "candles" not in doc:
+            raise EntryError("%s is not saved Kite candles ({\"candles\": [...]})" % f)
+        return chart_from_candles(sym, doc["candles"], doc.get("prev_close"), doc.get("data_time"), interval)
+    today = today or to_ist(utc_now()).date()
+    day = day or today
+    if interval == "1m" and (today - day).days > 55:
+        raise EntryError("Kite serves 1-minute candles for about 60 days: use --interval 5m for %s" % day)
+    try:
+        rows = kite.candles(sym, interval, frm=datetime.datetime.combine(day, datetime.time(9, 0)),
+                            to=datetime.datetime.combine(day, datetime.time(15, 59)))
+        prev_close, data_time = None, None
+        if day == today:
+            q = kite.quotes([sym]).get(sym) or {}
+            prev_close = q.get("prev_close")
+            if q.get("time"):
+                data_time = _unix(_ist_of(q["time"]))
+        else:
+            daily = kite.candles(sym, "1d", frm=day - datetime.timedelta(days=12), to=day - datetime.timedelta(days=1))
+            prev_close = daily[-1]["c"] if daily else None
+    except kite.KiteError as e:
+        raise EntryError(str(e))
+    return chart_from_candles(sym, rows, prev_close, data_time, interval)
 
 
 # ---------------------------------------------------------------- the rule
@@ -434,7 +386,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     by_slot = {}
     for b in chart["bars"]:
         if b["t"] % step:
-            continue                       # Yahoo's live tick (10:49:45) is not a bar
+            continue                       # a bar off the interval grid is not a bar
         et = to_ist(utc_of(b["t"]))
         if et.date() != day or not (open_dt <= et < close_dt):
             continue
@@ -447,14 +399,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
         b = by_slot[slot]
         end_ts = b["t"] + step
         if end_ts <= now_ts:
-            # Closed by the clock. On live data it counts once Yahoo has caught up: its last
+            # Closed by the clock. On live data it counts once Kite has caught up: its last
             # trade is at or after the close, a later bar exists, or a minute has passed.
             if dt is None or dt >= end_ts or slot < top or now_ts >= end_ts + SETTLE:
                 bars.append(b)
             else:
                 pending = b
                 res["forming"] = {"bar_start": hm(b["et"]), "closes": ampm(b["end"]), "price": r2(b["c"])}
-                res["lag_note"] = ("Yahoo's last trade is %s, before the %s bar's close: it counts once Yahoo "
+                res["lag_note"] = ("Kite's last trade is %s, before the %s bar's close: it counts once Kite "
                                    "catches up (a minute at most)" % (to_ist(utc_of(dt)).strftime("%H:%M:%S"),
                                                                        short(b["et"])))
         elif b["et"] <= local:
@@ -479,7 +431,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                 len(or_bars), n_or, short(or_end)))
             return res
         if not or_bars:
-            res.update(status="no-data", phase="open", reason="Yahoo sent no bars for the opening range")
+            res.update(status="no-data", phase="open", reason="Kite sent no candles for the opening range")
             return res
         lvl = max(b["h"] for b in or_bars)
     else:
@@ -512,11 +464,11 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                           "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if dt and utc_of(dt) < ist_to_utc(trig["end"]):
-            res["data_note"] = ("Yahoo's last trade is %s, before this bar closed: its close can still move a cent or two"
+            res["data_note"] = ("Kite's last trade is %s, before this bar closed: its close can still move a cent or two"
                                 % to_ist(utc_of(dt)).strftime("%H:%M:%S"))
         return res
     if not bars:
-        res.update(status="no-data", phase="open", reason="Yahoo sent no bars for %s yet" % day.isoformat())
+        res.update(status="no-data", phase="open", reason="Kite sent no candles for %s yet" % day.isoformat())
         return res
     what = "close above the range high ₹%.2f" % lvl if setup == "orb" else "close above ₹%.2f" % lvl
     if local >= cutoff and not (pending and pending["end"] <= cutoff):
@@ -554,7 +506,7 @@ def entry_doc(res, now_utc):
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": "kite", "checked_at": iso(now_utc), "reason": res.get("reason")}
 
 
 def write_json(path, doc):
@@ -583,7 +535,7 @@ def describe(res):
     """Plain lines for a person."""
     when = datetime.datetime.strptime(res["now"], "%Y-%m-%d %H:%M:%S")
     bars = "5-minute" if res["interval"] == "5m" else "1-minute"
-    head = "%s  %s %s IST  %s on %s bars (Yahoo, free, can lag)" % (
+    head = "%s  %s %s IST  %s on %s Kite candles" % (
         res["symbol"], when.strftime("%a %Y-%m-%d"), when.strftime("%H:%M"), setup_name(res), bars)
     if res.get("data_time") and res["data_time"] <= res["now"] and res["data_time"][:10] == res["date"]:
         head += ", data to %s" % res["data_time"][11:]
@@ -751,7 +703,7 @@ def watch_loop(provider, clock, sleep, emit, opts, every=30, until=None, max_err
         if until and local >= until:
             emit("Stopped at --until %s without a trigger. %s." % (short(until), res["reason"]))
             return 1, res
-        # sleep until just after the next bar closes; poll every `every` seconds if Yahoo is behind
+        # sleep until just after the next bar closes; poll every `every` seconds if Kite is behind
         cur_slot = int((local - open_dt).total_seconds()) // step
         expected_last = cur_slot - 1
         behind = (not bars) or bars[-1]["slot"] < expected_last
@@ -895,7 +847,7 @@ def cmd_watchlist(a):
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))
         n = sum(1 for _, r, _ in rows if r and r["status"] == "triggered")
         print("%d of %d triggered. Pick one, then: entry.py check <TICKER> --write, and /trader-exit." % (n, len(rows)))
-        print("Free Yahoo bars, unofficial and can lag. Nothing was placed.")
+        print("Zerodha Kite candles. Nothing was placed.")
     return 0 if any(r and r["status"] == "triggered" for _, r, _ in rows) else 1
 
 
@@ -911,7 +863,7 @@ def main(argv=None):
         p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this IST, e.g. "2026-11-11 10:20"')
-        p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON (.json/.json.gz) or a folder")
+        p.add_argument("--offline", metavar="PATH", help="saved Kite candles JSON (.json/.json.gz) or a folder")
         p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("check", help="the setup's status right now")
@@ -923,7 +875,7 @@ def main(argv=None):
     p = sub.add_parser("watch", help="poll bar by bar until it triggers or expires")
     p.add_argument("symbol")
     common(p)
-    p.add_argument("--every", type=float, default=30, help="seconds between polls while Yahoo is behind")
+    p.add_argument("--every", type=float, default=30, help="seconds between polls while Kite is behind")
     p.add_argument("--until", help="stop at this IST (HH:MM)")
     p.add_argument("--out", default="trader/entry.json", help="where a trigger is written")
     p = sub.add_parser("watchlist", help="check every hit in trader/watchlist.json")

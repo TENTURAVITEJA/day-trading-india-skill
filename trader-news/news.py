@@ -29,12 +29,12 @@ Sources (all Indian / India-edition):
     https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml
   - --market: Economic Times markets RSS (Nifty, Sensex, RBI, FII/DII flows):
     https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms
-  - The move: Yahoo Finance's chart for SYMBOL.NS (unofficial, can lag), the
-    last price against yesterday's close.
+  - The move: Zerodha Kite's live quote (one request for the whole watchlist,
+    through trader-broker/kite.py), the last price against yesterday's close.
 
 State: trader/state/news.json remembers what you have seen (30 days), so an
 item shows once. Offline: --offline DIR reads gnews-<T>.xml, nse-announcements.xml,
-et-markets.xml and chart-<T>.json from DIR.
+et-markets.xml and kite-quotes.json (Kite's /quote answer) from DIR.
 
 Headlines are leads, not facts: open the story (or the NSE filing) before
 acting, and treat nothing here as advice.
@@ -54,12 +54,24 @@ import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import importlib.util as _ilu
+
+
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("kite", os.path.join(os.path.dirname(here), "trader-broker", "kite.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
 
 GNEWS = "https://news.google.com/rss/search?q=%s&hl=en-IN&gl=IN&ceid=IN:en"
 ET_MARKETS = "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"
 NSE_RSS = "https://nsearchives.nseindia.com/content/RSS/Online_announcements.xml"
 NSE_LIST = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
-CHART = "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=1d&interval=5m"
 BROWSER_UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
 KEEP_DAYS = 30
 MOVE_PCT = 3.0  # a stock this far from yesterday's close is flagged as moving
@@ -199,14 +211,6 @@ def nse_names(fetcher, watch):
             watch[parts[0].strip().upper()] = parts[1].strip()
 
 
-def yahoo_symbol(sym):
-    """RELIANCE -> RELIANCE.NS; for BSE write RELIANCE.BO; .NS / .BO / ^index kept."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    return s + ".NS"
-
-
 def relevant(title, ticker, name):
     """A headline is kept only if it names the company: the ticker (TCS), or the
     leading word(s) of its name with their capitals (Reliance, not "reliance on")."""
@@ -259,7 +263,7 @@ def parse_time(value):
 
 
 def parse_rss(data, ticker):
-    """Yahoo headline RSS -> items."""
+    """Headline RSS (Google News, ET) -> items."""
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
@@ -311,39 +315,51 @@ def parse_nse_rss(data, watch):
     return out
 
 
-def parse_chart(data, ticker):
-    """Yahoo chart JSON -> {"ticker", "price", "prev_close", "pct", "time"} or raise."""
-    try:
-        doc = json.loads(data.decode("utf-8") if isinstance(data, bytes) else data)
-        meta = doc["chart"]["result"][0]["meta"]
-    except (ValueError, KeyError, IndexError, TypeError):
-        raise NewsError("chart for %s is not usable" % ticker)
-    price = meta.get("regularMarketPrice")
-    prev = meta.get("chartPreviousClose") or meta.get("previousClose")
+def parse_quote(q, ticker):
+    """One Kite quote (kite.quotes() row or the raw /quote object) -> {"ticker", "price", "prev_close", "pct", "time"}."""
+    if "last_price" in q:
+        q = {"last": q.get("last_price"), "prev_close": (q.get("ohlc") or {}).get("close"),
+             "time": q.get("last_trade_time")}
+    price, prev = q.get("last"), q.get("prev_close")
     if not price or not prev:
-        raise NewsError("chart for %s has no price" % ticker)
-    when = meta.get("regularMarketTime")
+        raise NewsError("Kite has no price for %s" % ticker)
+    when = None
+    if q.get("time"):
+        t = _dt.datetime.fromisoformat(str(q["time"]))
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=5, minutes=30)))
+        when = t.astimezone(_dt.timezone.utc)
     return {"ticker": ticker, "price": round(float(price), 2), "prev_close": round(float(prev), 2),
-            "pct": round((float(price) / float(prev) - 1) * 100, 2),
-            "time": _dt.datetime.fromtimestamp(when, _dt.timezone.utc) if when else None}
+            "pct": round((float(price) / float(prev) - 1) * 100, 2), "time": when}
 
 
 def collect_moves(fetcher, watch, errors=None):
     errors = [] if errors is None else errors
     out = []
-    for t in sorted(watch):
-        name = "chart-%s.json" % t
+    tickers = sorted(watch)
+    if not tickers:
+        return out
+    try:
+        if fetcher.offline:
+            raw = fetcher.get("offline", "kite-quotes.json")
+            doc = json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
+            doc = doc.get("data", doc)
+            got = {t: doc.get(kite.instrument(t)) or doc.get(t) for t in tickers}
+        else:
+            got = kite.quotes(tickers)
+    except (NewsError, kite.KiteError, ValueError) as exc:
+        if not (fetcher.offline and "no file" in str(exc)):
+            errors.append("prices: %s" % exc)
+        return out
+    for t in tickers:
+        q = got.get(t)
+        if not q:
+            errors.append("price for %s: Kite has no quote (check the symbol)" % t)
+            continue
         try:
-            try:
-                data = fetcher.get(CHART % ("query2", yahoo_symbol(t)), name)
-            except NewsError as exc:
-                if fetcher.offline or not re.search(r"HTTP (429|5\d\d)", str(exc)):
-                    raise
-                data = fetcher.get(CHART % ("query1", yahoo_symbol(t)), name)
-            out.append(parse_chart(data, t))
+            out.append(parse_quote(q, t))
         except NewsError as exc:
-            if not (fetcher.offline and "no file" in str(exc)):
-                errors.append("price for %s: %s" % (t, exc))
+            errors.append("price for %s: %s" % (t, exc))
     return out
 
 

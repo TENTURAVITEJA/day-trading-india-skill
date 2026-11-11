@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trader Indicators</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+:root{--bg:#0f1115;--panel:#171a21;--line:#262b36;--text:#e6e8ee;--mute:#8a93a6;--up:#26a69a;--down:#ef5350;
+--vwap:#f5a623;--ema:#4f8cff;--sma50:#c678dd;--or:#9aa4b8;--accent:#4f8cff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid var(--line)}
+header h1{font-size:16px;margin:0}
+.pill{padding:2px 10px;border-radius:999px;background:var(--panel);border:1px solid var(--line);color:var(--mute);font-size:12px}
+.pill.ok{color:var(--up);border-color:var(--up)} .pill.bad{color:var(--down);border-color:var(--down)}
+main{display:grid;grid-template-columns:330px 1fr 300px;gap:12px;padding:12px 16px;min-height:calc(100vh - 50px)}
+@media (max-width:1100px){main{grid-template-columns:1fr}}
+section{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:10px;min-width:0}
+h2{font-size:12px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);margin:0 0 8px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{font-size:11px;color:var(--mute);font-weight:500;text-align:right;padding:4px}
+th:first-child,td:first-child{text-align:left}
+td{padding:5px 4px;border-top:1px solid var(--line);text-align:right;white-space:nowrap}
+tr.row{cursor:pointer} tr.row:hover{background:#1e222b} tr.sel{background:#22293a}
+.up{color:var(--up)} .down{color:var(--down)} .mute{color:var(--mute)}
+.tag{display:inline-block;font-size:10px;padding:0 6px;border-radius:4px;background:#22293a;color:#aab4c8;margin:1px 2px 0 0}
+.bar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}
+.bar b{font-size:18px}
+button{background:#22293a;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:4px 10px;cursor:pointer}
+button.on{border-color:var(--accent);color:var(--accent)}
+#chart{height:420px} #rsi{height:130px;margin-top:6px}
+.legend{display:flex;gap:12px;font-size:12px;color:var(--mute);margin:6px 0;flex-wrap:wrap}
+.legend i{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:4px}
+dl{display:grid;grid-template-columns:1fr auto;gap:4px 8px;margin:0 0 12px;font-variant-numeric:tabular-nums}
+dt{color:var(--mute)} dd{margin:0;text-align:right}
+.err{color:var(--down);font-size:12px;margin:6px 0}
+.note{font-size:11px;color:var(--mute);margin-top:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Trader Indicators</h1>
+  <span id="mkt" class="pill">market …</span>
+  <span id="kite" class="pill">Kite …</span>
+  <span id="asof" class="pill">watchlist …</span>
+  <span class="pill">read-only · places no orders</span>
+</header>
+<main>
+  <section>
+    <h2>Watchlist · live Kite quotes + daily indicators</h2>
+    <table>
+      <thead><tr><th>Symbol</th><th>Last</th><th>Chg</th><th>RSI 14</th><th>vs SMA20</th></tr></thead>
+      <tbody id="wl"></tbody>
+    </table>
+    <div class="note">RSI and SMA20 are on daily candles. Click a row for its chart.</div>
+  </section>
+
+  <section>
+    <div class="bar">
+      <b id="sym">—</b><span id="last" class="mute"></span>
+      <span style="flex:1"></span>
+      <button data-tf="5m" class="on">5-min (today)</button><button data-tf="1d">Daily</button>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div id="err" class="err"></div>
+    <div id="chart"></div>
+    <div class="legend"><span>RSI 14 (Wilder) · 70 / 30 guides</span></div>
+    <div id="rsi"></div>
+  </section>
+
+  <section>
+    <h2>Indicator values</h2>
+    <dl id="stats"></dl>
+    <h2>Setups (daily rules)</h2>
+    <div id="setups" class="mute">—</div>
+    <h2 style="margin-top:14px">Trade plan</h2>
+    <dl id="plan"><dt class="mute">No plan for today</dt><dd></dd></dl>
+    <h2>Time Machine odds</h2>
+    <dl id="odds"><dt class="mute">Not run</dt><dd></dd></dl>
+    <div class="note">Indicators describe the chart; they are not a forecast or advice.</div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (x, d = 2) => x == null ? "—" : Number(x).toLocaleString("en-IN", {minimumFractionDigits: d, maximumFractionDigits: d});
+const pctCls = (x) => x == null ? "mute" : x >= 0 ? "up" : "down";
+async function api(path) {
+  const r = await fetch(path, {cache: "no-store"});
+  const j = await r.json();
+  if (!r.ok) throw new Error(j.error || r.statusText);
+  return j;
+}
+let current = null, tf = "5m", rows = [];
+
+// ---------- charts
+const css = getComputedStyle(document.documentElement);
+const c = (v) => css.getPropertyValue(v).trim();
+const base = {layout: {background: {color: c("--panel")}, textColor: c("--mute")},
+  grid: {vertLines: {color: c("--line")}, horzLines: {color: c("--line")}},
+  rightPriceScale: {borderColor: c("--line")}, timeScale: {borderColor: c("--line"), timeVisible: true, secondsVisible: false},
+  crosshair: {mode: 0}};
+const main = LightweightCharts.createChart($("chart"), {...base, autoSize: true});
+const candle = main.addCandlestickSeries({upColor: c("--up"), downColor: c("--down"), borderVisible: false,
+  wickUpColor: c("--up"), wickDownColor: c("--down")});
+const vol = main.addHistogramSeries({priceFormat: {type: "volume"}, priceScaleId: "vol"});
+main.priceScale("vol").applyOptions({scaleMargins: {top: 0.8, bottom: 0}});
+const lineA = main.addLineSeries({lineWidth: 2, priceLineVisible: false, lastValueVisible: true});
+const lineB = main.addLineSeries({lineWidth: 2, priceLineVisible: false, lastValueVisible: true});
+let priceLines = [];
+const rsiChart = LightweightCharts.createChart($("rsi"), {...base, autoSize: true});
+const rsiLine = rsiChart.addLineSeries({color: c("--accent"), lineWidth: 2, priceLineVisible: false});
+rsiLine.createPriceLine({price: 70, color: c("--down"), lineStyle: 2, lineWidth: 1, axisLabelVisible: false});
+rsiLine.createPriceLine({price: 30, color: c("--up"), lineStyle: 2, lineWidth: 1, axisLabelVisible: false});
+main.timeScale().subscribeVisibleLogicalRangeChange((r) => r && rsiChart.timeScale().setVisibleLogicalRange(r));
+
+function hline(price, color, title) {
+  if (price == null) return;
+  priceLines.push(candle.createPriceLine({price, color, lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title}));
+}
+
+async function loadChart() {
+  if (!current) return;
+  $("sym").textContent = current; $("err").textContent = "";
+  let d;
+  try { d = await api(`/api/chart?symbol=${encodeURIComponent(current)}&tf=${tf}`); }
+  catch (e) { $("err").textContent = e.message; return; }
+  candle.setData(d.candles);
+  vol.setData(d.volume.map(v => ({time: v.time, value: v.value, color: v.up ? "rgba(38,166,154,.35)" : "rgba(239,83,80,.35)"})));
+  priceLines.forEach(p => candle.removePriceLine(p)); priceLines = [];
+  const s = d.stats;
+  if (tf === "5m") {
+    lineA.applyOptions({color: c("--vwap"), title: "VWAP"}); lineA.setData(d.lines.vwap);
+    lineB.applyOptions({color: c("--ema"), title: "EMA20"}); lineB.setData(d.lines.ema20);
+    if (d.opening_range) { hline(d.opening_range.high, c("--or"), "OR high"); hline(d.opening_range.low, c("--or"), "OR low"); }
+    $("legend").innerHTML = `<span><i style="background:${c("--vwap")}"></i>VWAP</span><span><i style="background:${c("--ema")}"></i>EMA 20</span><span><i style="background:${c("--or")}"></i>Opening range (first 15 min)</span><span>Session ${d.session}</span>`;
+    stats([["Last (5-min close)", fmt(s.last)], ["Prev close", fmt(s.prev_close)], ["Day high", fmt(s.day_high)], ["Day low", fmt(s.day_low)],
+      ["VWAP", fmt(s.vwap)], ["EMA 20 (5-min)", fmt(s.ema20)], ["RSI 14 (5-min)", fmt(s.rsi, 1)],
+      ["OR high", fmt(d.opening_range && d.opening_range.high)], ["OR low", fmt(d.opening_range && d.opening_range.low)],
+      ["Volume", fmt(s.volume, 0)], ["Last bar", s.last_bar]]);
+  } else {
+    lineA.applyOptions({color: c("--ema"), title: "SMA20"}); lineA.setData(d.lines.sma20);
+    lineB.applyOptions({color: c("--sma50"), title: "SMA50"}); lineB.setData(d.lines.sma50);
+    hline(d.high20, c("--or"), "20-day closing high");
+    $("legend").innerHTML = `<span><i style="background:${c("--ema")}"></i>SMA 20</span><span><i style="background:${c("--sma50")}"></i>SMA 50</span><span><i style="background:${c("--or")}"></i>Highest close of the prior 20 days</span>`;
+    stats([["Last close", fmt(s.last)], ["Prev close", fmt(s.prev_close)], ["SMA 20", fmt(s.sma20)], ["SMA 50", fmt(s.sma50)],
+      ["RSI 14 (daily)", fmt(s.rsi, 1)], ["20-day closing high", fmt(s.high20)], ["Last candle", s.last_bar]]);
+  }
+  $("setups").innerHTML = (d.setups || []).length ? d.setups.map(x => `<span class="tag">${x.label}</span>`).join(" ")
+    : (tf === "1d" ? "No daily rule matched" : "Switch to Daily to see them");
+  rsiLine.setData(d.rsi);
+  main.timeScale().fitContent(); rsiChart.timeScale().fitContent();
+}
+function stats(pairs) { $("stats").innerHTML = pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join(""); }
+
+// ---------- watchlist
+async function loadWatchlist() {
+  const w = await api("/api/watchlist");
+  rows = w.rows;
+  $("asof").textContent = w.from_scan ? `watchlist: ${w.mode || ""} scan, ${w.as_of || ""}` : "no scan yet: default list";
+  $("wl").innerHTML = rows.map(r => `<tr class="row" data-s="${r.symbol}"><td>${r.symbol}<br>${(r.tags || []).map(t => `<span class="tag">${t.label}</span>`).join("")}</td>
+    <td id="l-${r.symbol}">…</td><td id="p-${r.symbol}">…</td><td id="r-${r.symbol}" class="mute">…</td><td id="m-${r.symbol}" class="mute">…</td></tr>`).join("");
+  document.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => select(tr.dataset.s));
+  if (!current && rows.length) select(rows[0].symbol);
+  loadQuotes();
+  for (const r of rows) {        // one at a time: Kite allows ~3 historical requests a second
+    try {
+      const d = await api(`/api/daily?symbol=${encodeURIComponent(r.symbol)}`);
+      const rc = $(`r-${r.symbol}`); rc.textContent = fmt(d.rsi, 1);
+      rc.className = d.rsi >= 70 ? "down" : d.rsi <= 30 ? "up" : "";
+      r.sma20 = d.sma20; paintSma(r.symbol);
+    } catch (e) { $(`r-${r.symbol}`).textContent = "—"; }
+  }
+}
+const lastPx = {};
+function paintSma(s) {
+  const r = rows.find(x => x.symbol === s), cell = $(`m-${s}`);
+  if (!r || !cell || r.sma20 == null || lastPx[s] == null) return;
+  const p = (lastPx[s] / r.sma20 - 1) * 100;
+  cell.textContent = (p >= 0 ? "+" : "") + p.toFixed(1) + "%"; cell.className = pctCls(p);
+}
+async function loadQuotes() {
+  if (!rows.length) return;
+  try {
+    const q = await api(`/api/quotes?symbols=${rows.map(r => r.symbol).join(",")}`);
+    for (const [s, v] of Object.entries(q.quotes)) {
+      lastPx[s] = v.last;
+      if ($(`l-${s}`)) $(`l-${s}`).textContent = fmt(v.last);
+      const p = $(`p-${s}`); if (p) { p.textContent = v.pct == null ? "—" : (v.pct >= 0 ? "+" : "") + v.pct.toFixed(2) + "%"; p.className = pctCls(v.pct); }
+      paintSma(s);
+      if (s === current) $("last").innerHTML = `₹${fmt(v.last)} <span class="${pctCls(v.pct)}">${v.pct == null ? "" : (v.pct >= 0 ? "+" : "") + v.pct.toFixed(2) + "%"}</span> <span class="mute">at ${v.time} IST</span>`;
+    }
+  } catch (e) { $("err").textContent = e.message; }
+}
+function select(s) {
+  current = s;
+  document.querySelectorAll("tr.row").forEach(tr => tr.classList.toggle("sel", tr.dataset.s === s));
+  loadChart(); loadQuotes();
+}
+document.querySelectorAll("button[data-tf]").forEach(b => b.onclick = () => {
+  tf = b.dataset.tf; document.querySelectorAll("button[data-tf]").forEach(x => x.classList.toggle("on", x === b)); loadChart();
+});
+
+// ---------- status + trade
+async function loadStatus() {
+  try {
+    const s = await api("/api/status");
+    $("mkt").textContent = `NSE ${s.market.open ? "open" : "closed"} · ${s.market.now} IST`;
+    $("mkt").className = "pill " + (s.market.open ? "ok" : "");
+    $("kite").textContent = s.kite.connected ? `Kite: ${s.kite.user}` : "Kite: not logged in (run kite.py login)";
+    $("kite").className = "pill " + (s.kite.connected ? "ok" : "bad");
+  } catch (e) {}
+}
+async function loadTrade() {
+  try {
+    const t = await api("/api/trade");
+    if (t.plan) {
+      const p = t.plan;
+      $("plan").innerHTML = [["Symbol", p.symbol + (p.stale ? " (old plan " + p.date + ")" : "")], ["Entry", fmt(p.entry)], ["Stop", fmt(p.stop)],
+        ["Target", fmt(p.target)], ["Risk / share", fmt(p.risk_per_share)], ["Reward:risk", fmt(p.reward_risk, 1)], ["Flat by", p.flat_by]]
+        .map(([k, v]) => `<dt>${k}</dt><dd>${v ?? "—"}</dd>`).join("");
+    }
+    if (t.odds) {
+      const o = t.odds, pc = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
+      $("odds").innerHTML = [["Target first", pc(o.p_target)], ["Stop first", pc(o.p_stop)], ["Neither", pc(o.p_neither)],
+        ["Average R", fmt(o.avg_R, 3)], ["Replays", fmt(o.replays, 0)]].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+    }
+  } catch (e) {}
+}
+
+loadStatus(); loadTrade(); loadWatchlist().catch(e => $("err").textContent = e.message);
+setInterval(loadQuotes, 15000);
+setInterval(() => { if (tf === "5m") loadChart(); }, 60000);
+setInterval(() => { loadStatus(); loadTrade(); }, 30000);
+</script>
+</body>
+</html>

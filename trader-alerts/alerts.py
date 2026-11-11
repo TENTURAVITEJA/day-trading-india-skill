@@ -31,11 +31,11 @@ are for the plan's day only). An above / below alert rings ONCE and then stays
 quiet until you reset it, unless the rule has "rearm": true (it re-arms when
 the price crosses back). A pct_move alert rings at most once per day.
 
-Quotes (free, delayed, unofficial; for alerts only, never for timing an order):
-  yahoo   https://query2.finance.yahoo.com/v8/finance/chart/ADANIENT (falls back to
-          query1 on a 429 or a 5xx; one retry with a pause on a 429; one
-          request per ticker, half a second apart; the default)
-  --offline DIR reads DIR/<source>-<TICKER>.json|csv (or .json.gz) instead.
+Quotes: Zerodha Kite Connect /quote (live last traded price, day high / low,
+previous close), every ticker in one request, through trader-broker/kite.py
+(log in once a day:  kite.py login).
+  --offline DIR reads DIR/kite-<TICKER>.json (or .json.gz) instead: one Kite
+  quote object ({"last_price", "ohlc": {...}, "last_trade_time"}).
 
 NSE calendar: the 2026 trading holidays as
 published by NSE (equity segment trading holidays circular for 2026).
@@ -52,13 +52,21 @@ import os
 import re
 import sys
 import time
-import urllib.error
-import urllib.request
+import importlib.util as _ilu
+
+
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = _ilu.spec_from_file_location("kite", os.path.join(os.path.dirname(here), "trader-broker", "kite.py"))
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
 
 UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-PAUSE = 0.5    # seconds between requests: be polite to free endpoints
-BACKOFF = 2.0  # seconds to wait before the one retry after a 429
-YAHOO_HOSTS = ("query2.finance.yahoo.com", "query1.finance.yahoo.com")
 HHMM = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)$")
 
 NSE_HOLIDAYS = {
@@ -89,19 +97,6 @@ EARLY = datetime.time(13, 0)   # unused: NSE has no scheduled early closes (NSE_
 
 class AlertError(Exception):
     pass
-
-
-def yahoo_symbol(sym):
-    """NSE/BSE symbol -> Yahoo symbol: ADANIENT -> ADANIENT.NS; for BSE write ADANIENT.BO (Yahoo has no numeric scrip codes);
-    an explicit .NS / .BO suffix or an index like ^NSEI is kept as is."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    if s.endswith(".BSE"):
-        return s[:-4] + ".BO"
-    if s.endswith(".NSE"):
-        return s[:-4] + ".NS"
-    return s + ".NS"
 
 
 # ---------------------------------------------------------------- time
@@ -182,89 +177,33 @@ def market_status(now_utc):
 
 # ---------------------------------------------------------------- quotes
 
-def yahoo_url(sym, host=YAHOO_HOSTS[0]):
-    return "https://%s/v8/finance/chart/%s?range=1d&interval=1d" % (host, yahoo_symbol(sym))
+def _utc_text(t):
+    """Kite time ('2026-11-11 15:59:28' IST, or ISO) -> '...Z' UTC text."""
+    if not t:
+        return ""
+    dt = datetime.datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt - datetime.timedelta(hours=5, minutes=30)
+    else:
+        dt = (dt - dt.utcoffset()).replace(tzinfo=None)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def parse_yahoo(text, sym):
-    try:
-        data = json.loads(text)
-        res = data["chart"]["result"]
-    except (ValueError, KeyError, TypeError):
-        raise AlertError("Yahoo returned something unexpected for %s" % sym)
-    if not res:
-        err = (data.get("chart") or {}).get("error") or {}
-        raise AlertError("Yahoo has no data for %s: %s" % (sym, err.get("description", "unknown ticker")))
-    m = res[0].get("meta", {})
-    price = m.get("regularMarketPrice")
-    if price is None:
-        raise AlertError("Yahoo has no price for %s" % sym)
-    t = m.get("regularMarketTime")
-    when = (datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            if t else "")
-    q = (res[0].get("indicators", {}).get("quote") or [{}])[0]
-    opens = [x for x in (q.get("open") or []) if x is not None]
-    return {"symbol": sym.upper(), "price": float(price), "open": opens[0] if opens else None,
-            "high": m.get("regularMarketDayHigh"), "low": m.get("regularMarketDayLow"),
-            "prev_close": m.get("previousClose") or m.get("chartPreviousClose"), "time": when,
-            "currency": m.get("currency"), "source": "yahoo"}
-
-
-_urlopen = urllib.request.urlopen   # tests swap these two
-_sleep = time.sleep
-
-
-def _get(url, timeout=20):
-    """(HTTP status, body). A network failure is an AlertError."""
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "*/*"})
-    try:
-        with _urlopen(req, timeout=timeout) as r:
-            return 200, r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as e:
-        try:
-            body = e.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        finally:
-            try:
-                e.close()
-            except Exception:
-                pass
-        return e.code, body
-    except urllib.error.URLError as e:
-        raise AlertError("could not reach %s: %s" % (url.split("/")[2], e.reason))
-
-
-def fetch(url, timeout=20):
-    code, text = _get(url, timeout)
-    if code != 200:
-        raise AlertError("%s answered HTTP %d" % (url.split("?")[0], code))
-    return text
-
-
-def fetch_yahoo(sym, timeout=20):
-    """query2 first. A 429 waits BACKOFF seconds and tries once more; a 429 or a 5xx
-    after that moves on to query1. A 404 comes back as Yahoo's own error JSON."""
-    last = None
-    for host in YAHOO_HOSTS:
-        url = yahoo_url(sym, host)
-        code, text = _get(url, timeout)
-        if code == 429:
-            _sleep(BACKOFF)
-            code, text = _get(url, timeout)
-        if code == 200:
-            return text
-        if code == 404 and text.strip().startswith("{"):
-            return text
-        last = (url, code)
-        if code != 429 and code < 500:
-            break
-    raise AlertError("%s answered HTTP %d" % (last[0].split("?")[0], last[1]))
+def quote_from_kite(d, sym):
+    """One Kite quote (kite.quotes() row, or the raw /quote object) -> the alert quote."""
+    if "last_price" in d:      # the raw /quote object
+        o = d.get("ohlc") or {}
+        d = {"last": d.get("last_price"), "prev_close": o.get("close"), "open": o.get("open"),
+             "high": o.get("high"), "low": o.get("low"), "time": d.get("last_trade_time") or d.get("timestamp")}
+    if d.get("last") is None:
+        raise AlertError("Kite has no price for %s" % sym)
+    return {"symbol": sym.upper(), "price": float(d["last"]), "open": d.get("open") or None,
+            "high": d.get("high") or None, "low": d.get("low") or None, "prev_close": d.get("prev_close"),
+            "time": _utc_text(d.get("time")), "currency": "INR", "source": "kite"}
 
 
 def _offline_text(folder, source, sym):
-    ext = "json"
-    base = os.path.join(folder, "%s-%s.%s" % (source, sym, ext))
+    base = os.path.join(folder, "%s-%s.json" % (source, sym))
     if os.path.exists(base):
         with open(base, encoding="utf-8") as fh:
             return fh.read()
@@ -274,19 +213,27 @@ def _offline_text(folder, source, sym):
     raise AlertError("no offline quote file %s" % base)
 
 
-def get_quotes(symbols, source="yahoo", offline=None, pause=PAUSE):
-    """{SYM: quote} and [errors]. One request per ticker, with a pause between."""
+def get_quotes(symbols, source="kite", offline=None):
+    """{SYM: quote} and [errors]. Live: every ticker in one Kite /quote request."""
     quotes, errors = {}, []
-    for i, sym in enumerate(symbols):
-        sym = sym.upper()
+    syms = [s.upper() for s in symbols]
+    if offline:
+        for sym in syms:
+            try:
+                quotes[sym] = quote_from_kite(json.loads(_offline_text(offline, source, sym)), sym)
+            except (AlertError, ValueError) as e:
+                errors.append(str(e))
+        return quotes, errors
+    try:
+        got = kite.quotes(syms)
+    except kite.KiteError as e:
+        return {}, [str(e)]
+    for sym in syms:
+        if sym not in got:
+            errors.append("Kite has no quote for %s (check the symbol)" % sym)
+            continue
         try:
-            if offline:
-                text = _offline_text(offline, source, sym)
-            else:
-                if i and pause:
-                    _sleep(pause)
-                text = fetch_yahoo(sym)
-            quotes[sym] = parse_yahoo(text, sym)
+            quotes[sym] = quote_from_kite(got[sym], sym)
         except AlertError as e:
             errors.append(str(e))
     return quotes, errors
@@ -308,7 +255,7 @@ def write_prices(path, quotes, now_utc, source):
         detail[s] = {"prev_close": q.get("prev_close"), "time": q.get("time"), "source": q.get("source"),
                      "fetched": stamp}
     doc = {"as_of": stamp, "source": source,
-           "note": ("Delayed quotes for alerts and sizing checks. Your broker's price is the one that fills. "
+           "note": ("Zerodha Kite quotes for alerts and sizing checks. The fill price can differ. "
                     "detail.fetched is when each price was read."),
            "prices": prices, "detail": detail}
     _write(path, doc)
@@ -545,7 +492,7 @@ def cmd_quote(a):
             print("error: " + e)
         if a.write and quotes:
             print("Wrote %d price(s) to %s." % (len(quotes), a.write))
-        print("Quotes are free, delayed and unofficial: for alerts only. Your broker's price is the one that fills.")
+        print("Live quotes from Zerodha Kite. The fill price can still differ from the last trade.")
     return 0 if quotes else 1
 
 
@@ -684,8 +631,8 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd")
 
     def net(p):
-        p.add_argument("--source", default="yahoo", choices=["yahoo"])
-        p.add_argument("--offline", metavar="DIR", help="read <source>-<TICKER>.json|csv files, no network")
+        p.add_argument("--source", default="kite", choices=["kite"])
+        p.add_argument("--offline", metavar="DIR", help="read kite-<TICKER>.json quote files, no network")
         p.add_argument("--now", help="pretend it is this time (no offset = IST)")
         p.add_argument("--json", action="store_true")
 

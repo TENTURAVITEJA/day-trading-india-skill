@@ -2,7 +2,7 @@
 name: trader-entry
 description: >-
   Entry Timer. Watches a setup bar by bar and tells you the moment to get in.
-  Reads free Yahoo 1-minute or 5-minute bars, builds the opening range (the
+  Reads Zerodha Kite 1-minute or 5-minute candles, builds the opening range (the
   first 15 minutes by default) and calls the entry on the first completed bar
   that CLOSES above the range high, or above a level you give it (like a
   20-day high from the scanner), with an optional volume check. Says waiting
@@ -35,8 +35,8 @@ python3 "${CLAUDE_SKILL_DIR}/entry.py" watch ADANIENT --until 15:30    # one lin
 python3 "${CLAUDE_SKILL_DIR}/entry.py" watchlist                   # every hit in trader/watchlist.json
 ```
 
-Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (a
-saved Yahoo chart JSON, `.json` or `.json.gz`, or a folder of
+Other flags: `--or-minutes N` (default 15), `--json`, `--offline FILE` (saved
+Kite candles `{"candles": [...]}`, `.json` or `.json.gz`, or a folder of
 `<TICKER>.json`), `--now "2026-11-11 10:20"` (IST) to replay a day.
 `watch` with `--now` or `--offline` runs on a simulated clock and replays the
 day bar by bar without waiting.
@@ -47,7 +47,7 @@ day bar by bar without waiting.
 | --- | --- |
 | `trader/watchlist.json` | the scanner's hits (`hits[].symbol`), for `watchlist` |
 | `trader/config.json` | `no_entries_before` (09:30) and `no_entries_after` (15:30), IST. Optional |
-| Yahoo chart API | today's bars, `range=1d&interval=5m` (or `1m`): free, unofficial, can lag |
+| Zerodha Kite | today's 5-minute (or 1-minute) candles, and the live quote for the last trade time and previous close |
 | `trader/entry.json` | with `check --write`, or when `watch` triggers: symbol, setup, status, time, bar, price, level, opening range |
 
 ## The rule
@@ -62,8 +62,8 @@ day bar by bar without waiting.
 - **The time** is that bar's close time (the 10:10 bar closes at 10:15 AM).
   The price is its close, to the cent.
 - **Only closed bars count.** A bar is closed when the clock passes its start
-  plus 5 (or 1) minutes and Yahoo has caught up to that moment (it waits a
-  minute at most). Yahoo's live tick, like 10:49:45, is never a bar.
+  plus 5 (or 1) minutes and Kite's last trade is at or past that moment (it
+  waits a minute at most). The candle still forming is never a bar.
 - **Volume, if you want it.** `--min-volume-x 1.5` also needs the trigger
   bar's volume at 1.5 times the range bars' average. The 9:15 bar holds the
   opening auction, so 1.0 is already strict.
@@ -106,7 +106,7 @@ The 10:15 bar is still forming (₹2768.50 so far, closes 10:20 AM); it does not
 At 10:20 the bar has closed:
 
 ```
-ADANIENT  Wed 2026-11-11 10:20 IST  opening-range breakout (15-minute range) on 5-minute bars (Yahoo, free, can lag)
+ADANIENT  Wed 2026-11-11 10:20 IST  opening-range breakout (15-minute range) on 5-minute Kite candles
 Opening range 9:15-9:30: high ₹2746.70, low ₹2728.80 (3 of 3 bars).
 TRIGGERED 10:20 AM at ₹2768.50: the 10:15 bar (bar 12) closed above the range high ₹2746.70 (+0.79%).
 This is the moment to get in, if you take the trade. Nothing was placed.
@@ -119,8 +119,8 @@ tool says the trigger is stale ("a late entry is a different trade").
 
 ## Rules
 
-- Bar by bar, on free Yahoo 1-minute or 5-minute bars. They are unofficial
-  and can lag. Say so when a minute matters.
+- Bar by bar, on Zerodha Kite 1-minute or 5-minute candles. A candle counts
+  once it has closed. Say so when a minute matters.
 - A signal is information, not an order, and not a promise. Nothing here
   promises winning trades or money.
 - Long side only. v2 plans longs only. If the user wants a short, say that.

@@ -13,12 +13,12 @@ universe  Downloads NSE's list of listed equities (EQUITY_L.csv from
           nsearchives.nseindia.com) or a Nifty index's constituents (--list
           nifty50 / nifty100 / nifty200 / nifty500) and keeps EQ-series
           stocks only: BE / BZ (trade-for-trade) and SME series cannot be
-          traded intraday. Charts are read from Yahoo as SYMBOL.NS (for the BSE
-          listing write the symbol with .BO, like RELIANCE.BO).
+          traded intraday. For the BSE listing write the symbol with .BO,
+          like RELIANCE.BO.
 
-daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
-          3 months of 1-day bars, closes only). Liquidity from the spark meta:
-          regularMarketPrice >= --min-price (Rs 50) and regularMarketVolume >=
+daily     Pre-market scan of daily candles from Zerodha Kite (about 5 months of
+          1-day candles, one historical request per symbol). Liquidity: the
+          last close >= --min-price (Rs 50) and the last session's volume >=
           --min-volume (200,000 shares). Setups, from closes only:
             breakout_20d     the last close is above every close of the 20 before it
             bull_flag        up more than 10 % over the 10 sessions before the
@@ -26,34 +26,29 @@ daily     Pre-market scan of daily CLOSES (Yahoo spark: 20 symbols a request,
             reclaim_ma20     closed under the 20-day average, then closed above it
             oversold         RSI 14 (Wilder) under 30
             oversold_bounce  RSI 14 was under 30 yesterday and today closed up
-          Today's daily bar is dropped until the session's close.
+          Today's daily candle is dropped until the session's close.
 
-orb       Opening-range breakouts, 5-minute bars. The range is the first
-          --or-minutes (15) of the session. Stage 1: spark closes for every
-          symbol (1 day of 5-minute bars, 20 a request); a chart goes on only
-          if a completed bar after the range closed at or above the highest
-          close of the range (a necessary condition). Stage 2: each candidate's
-          v8 chart (real highs and lows): range high = the highest high of the
-          range bars, a hit = the first completed bar to CLOSE above it, at that
-          bar's close time. Stage 2 fetches at most --max-confirm (200) charts,
-          the most traded candidates first (price x volume so far), and says
-          so when it stops short. A chart is usable only when every 5-minute
-          bar from 9:15 to the cutoff is there (a missing bar is a halt or no
-          trades). Floors: --min-price Rs 50 (last close), --min-volume 0.
+orb       Opening-range breakouts on Kite 5-minute candles (real highs and
+          lows). The range is the first --or-minutes (15) of the session:
+          range high = the highest high of the range bars, a hit = the first
+          completed bar to CLOSE above it, at that bar's close time. A chart
+          is usable only when every 5-minute bar from 9:15 to the cutoff is
+          there (a missing bar is a halt or no trades). Floors: --min-price
+          Rs 50 (last close), --min-volume 0.
 
-Bars: null closes are dropped, a bar off the 5-minute grid (the live tick,
-like 10:49:45) is dropped, and a bar counts only once it is complete
-(start + 5 minutes <= the clock). Times are IST . --now pins the
-clock ("2026-10-19 10:15", IST; ...Z for UTC).
+Bars: a bar counts only once it is complete (start + 5 minutes <= the clock).
+Times are IST. --now pins the clock ("2026-10-19 10:15", IST; ...Z for UTC).
 
-Yahoo's endpoints are free, unofficial and can lag. query2 first, query1 on
-a 429 or 5xx, one retry after a pause on a 429. A polite pause between
-requests (--pause). Partial results are reported as partial.
+Data: Zerodha Kite Connect historical candles through trader-broker/kite.py
+(log in once a day:  python3 trader-broker/kite.py login). Kite allows about 3
+historical requests a second, so the Nifty 500 takes about 3 minutes and the
+whole NSE list about 12. Partial results are reported as partial.
 
---offline PATH reads files instead of the network: universe wants a saved
-NSE csv (or a folder with it); daily and orb take a folder of
-<T>.json v8 chart files or spark responses, or one file that is a spark
-response, a v8 chart, or a bundle {"RELIANCE": <v8 json>, ...}. .json.gz is fine.
+--offline PATH reads saved Kite candles instead of the network: universe wants
+a saved NSE csv (or a folder with it); daily and orb take a folder of
+<TICKER>.json files, each Kite's historical answer {"candles": [[time, o, h,
+l, c, v], ...]}, or one bundle file {"RELIANCE": {"candles": [...]}, ...}.
+.json.gz is fine.
 
 A scan is a list of charts that match a rule, not a list of stocks to buy.
 Exit code 0 when the scan found something, 1 when it did not or could not run.
@@ -70,16 +65,26 @@ import time
 import urllib.error
 import urllib.request
 
+import importlib.util as _ilu
+
+
+def _load_kite():
+    """trader-broker/kite.py, the one Kite client every skill shares (a sibling folder)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(os.path.dirname(here), "trader-broker", "kite.py")
+    spec = _ilu.spec_from_file_location("kite", path)
+    mod = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+kite = _load_kite()
+
 UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-YAHOO_HOSTS = ("https://query2.finance.yahoo.com", "https://query1.finance.yahoo.com")
 NSE_URL = "https://nsearchives.nseindia.com/"
 BROWSER_UA = "day-trader-skill-india/2.0 (python-urllib; personal use)"
-SPARK_MAX = 20      # Yahoo's spark answers 400 above 20 symbols
-PAUSE = 0.3         # seconds between requests: be polite to free endpoints
-BACKOFF = 5.0       # seconds to wait before the one retry after a 429
 SLEEP = time.sleep  # tests swap this out
 BAR_MIN = 5
-MAX_CONFIRM = 200   # stage-2 v8 charts per orb scan, most traded first
 MIN_DAILY_BARS = 30
 DEFAULT_UNIVERSE = "trader/universe.txt"
 NOTE = "A scan is a list of charts that match a rule, not a list of stocks to buy."
@@ -123,17 +128,9 @@ class ScanError(Exception):
     pass
 
 
-def yahoo_symbol(sym):
-    """NSE/BSE symbol -> Yahoo symbol: RELIANCE -> RELIANCE.NS; for BSE write RELIANCE.BO (Yahoo has no numeric scrip codes);
-    an explicit .NS / .BO suffix or an index like ^NSEI is kept as is."""
-    s = str(sym).strip().upper()
-    if s.startswith("^") or s.endswith(".NS") or s.endswith(".BO"):
-        return s
-    if s.endswith(".BSE"):
-        return s[:-4] + ".BO"
-    if s.endswith(".NSE"):
-        return s[:-4] + ".NS"
-    return s + ".NS"
+def kite_symbol(sym):
+    """RELIANCE -> NSE:RELIANCE; RELIANCE.BO -> BSE:RELIANCE (Kite's instrument names)."""
+    return kite.instrument(sym)
 
 
 # ---------------------------------------------------------------- time
@@ -214,108 +211,34 @@ def http_get(url, timeout=20):
         return r.read().decode("utf-8", "replace")
 
 
-def yahoo_get(path):
-    """GET a Yahoo Finance path. query2 first, query1 on a 429 or 5xx, and one
-    more round after BACKOFF seconds if a 429 was seen. 4xx other than 429 is final."""
-    last = "no answer"
-    for attempt in (0, 1):
-        saw_429 = False
-        for host in YAHOO_HOSTS:
-            try:
-                return http_get(host + path)
-            except urllib.error.HTTPError as e:
-                last = "HTTP %d" % e.code
-                try:
-                    body = e.read().decode("utf-8", "replace") if 400 <= e.code < 500 and e.code != 429 else ""
-                except Exception:
-                    body = ""
-                finally:
-                    e.close()
-                if e.code == 429:
-                    saw_429 = True
-                    continue
-                if e.code >= 500:
-                    continue
-                if body.strip().startswith("{"):
-                    return body  # Yahoo's JSON error ("No data found"), parsed by the caller
-                raise ScanError("Yahoo answered %s for %s" % (last, path.split("?")[0]))
-            except (urllib.error.URLError, OSError) as e:
-                last = str(getattr(e, "reason", e))
-                continue
-        if attempt == 0 and saw_429:
-            SLEEP(BACKOFF)
-            continue
-        break
-    raise ScanError("Yahoo answered %s for %s" % (last, path.split("?")[0]))
-
-
-def plain_symbol(ysym):
-    """RELIANCE.NS -> RELIANCE (the name trader/ files use); RELIANCE.BO keeps its .BO."""
-    s = str(ysym).strip().upper()
+def plain_symbol(sym):
+    """RELIANCE.NS / NSE:RELIANCE -> RELIANCE (the name trader/ files use); RELIANCE.BO keeps its .BO."""
+    s = str(sym).strip().upper()
+    if s.startswith("NSE:"):
+        s = s[4:]
+    elif s.startswith("BSE:"):
+        s = s[4:] + ".BO"
     return s[:-3] if s.endswith(".NS") else s
-
-
-def to_yahoo(sym):
-    return yahoo_symbol(sym)
-
-
-def spark_path(symbols, rng, interval):
-    return "/v7/finance/spark?symbols=%s&range=%s&interval=%s" % (
-        ",".join(to_yahoo(s) for s in symbols), rng, interval)
-
-
-def chart_path(sym, rng, interval):
-    return "/v8/finance/chart/%s?range=%s&interval=%s" % (to_yahoo(sym), rng, interval)
 
 
 # ---------------------------------------------------------------- parsing
 
-def series_from_result(res):
-    """A Yahoo chart result (v8 or one spark response) -> plain lists."""
-    q = ((res.get("indicators") or {}).get("quote") or [{}])[0] or {}
-    t = res.get("timestamp") or []
-    n = len(t)
-
-    def col(k):
-        v = q.get(k)
-        return list(v) + [None] * (n - len(v)) if isinstance(v, list) else None
-    return {"t": list(t), "c": col("close") or [None] * n, "o": col("open"), "h": col("high"),
-            "l": col("low"), "v": col("volume"), "meta": res.get("meta") or {}}
-
-
-def parse_spark(text_or_doc, wanted=None):
-    """Spark JSON -> {SYM: series}. Symbols Yahoo does not know are simply missing
-    from the answer. `wanted` maps Yahoo symbols back to ours (BRK-B -> BRK.B)."""
-    doc = json.loads(text_or_doc) if isinstance(text_or_doc, str) else text_or_doc
-    sp = (doc or {}).get("spark") if isinstance(doc, dict) else None
-    if not isinstance(sp, dict):
-        raise ScanError("Yahoo's spark answer is not the shape this tool knows")
-    err = sp.get("error")
-    out = {}
-    for item in sp.get("result") or []:
-        resp = item.get("response") or []
-        if not resp:
-            continue
-        ysym = item.get("symbol") or (resp[0].get("meta") or {}).get("symbol") or ""
-        sym = (wanted or {}).get(ysym.upper(), plain_symbol(ysym))
-        out[sym] = series_from_result(resp[0])
-    if err and not out:
-        raise ScanError("Yahoo spark: %s" % (err.get("description") or err.get("code") or err))
-    return out
-
-
-def parse_chart(text_or_doc, sym=""):
-    """v8 chart JSON -> series. Raises ScanError for Yahoo's 'no data' answers."""
-    try:
-        doc = json.loads(text_or_doc) if isinstance(text_or_doc, str) else text_or_doc
-        chart = doc["chart"]
-    except (ValueError, KeyError, TypeError):
-        raise ScanError("Yahoo returned something unexpected for %s" % sym)
-    res = chart.get("result")
-    if not res:
-        err = chart.get("error") or {}
-        raise ScanError("no data for %s: %s" % (sym, err.get("description", "unknown ticker")))
-    return series_from_result(res[0])
+def series_from_candles(rows):
+    """Kite candles -> the plain series the scan rules read: {"t": unix seconds, "o","h","l","c","v", "meta"}.
+    rows are kite.candles() dicts ({"dt": naive IST, ...}) or Kite's raw [time, o, h, l, c, v] lists."""
+    t, o, h, l, c, v = [], [], [], [], [], []
+    for r in rows:
+        if isinstance(r, dict):
+            dt, oo, hh, ll, cc, vv = r["dt"], r["o"], r["h"], r["l"], r["c"], r["v"]
+        else:
+            dt = datetime.datetime.fromisoformat(str(r[0]).replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = (dt - dt.utcoffset()).replace(tzinfo=None) + datetime.timedelta(hours=5, minutes=30)
+            oo, hh, ll, cc, vv = r[1], r[2], r[3], r[4], r[5] if len(r) > 5 else 0
+        t.append(int((ist_to_utc(dt) - datetime.datetime(1970, 1, 1)).total_seconds()))
+        o.append(oo); h.append(hh); l.append(ll); c.append(cc); v.append(vv or 0)
+    meta = {"last": c[-1] if c else None, "volume": v[-1] if v else None}
+    return {"t": t, "c": c, "o": o, "h": h, "l": l, "v": v, "meta": meta}
 
 
 def _read_maybe_gz(path):
@@ -334,30 +257,27 @@ def _stem(name):
 
 
 def _absorb(doc, name_hint, data, errors):
-    """One parsed offline JSON doc -> data / errors."""
-    if isinstance(doc, dict) and "spark" in doc:
-        data.update(parse_spark(doc))
-    elif isinstance(doc, dict) and "chart" in doc:
-        sym = name_hint
-        if not sym:
-            try:
-                sym = (doc["chart"].get("result") or [{}])[0]["meta"]["symbol"]
-            except (AttributeError, KeyError, TypeError, IndexError):
-                raise ScanError("an offline v8 chart without a symbol: name the file <TICKER>.json")
-        sym = plain_symbol(sym)
-        try:
-            data[sym] = parse_chart(doc, sym)
-        except ScanError as e:
-            errors[sym] = str(e)
+    """One parsed offline JSON doc -> data / errors. A Kite historical answer
+    ({"candles": [...]}, optionally wrapped in {"status", "data"}) or a bundle of them."""
+    if isinstance(doc, dict) and "data" in doc and isinstance(doc["data"], dict) and "candles" in doc["data"]:
+        doc = doc["data"]
+    if isinstance(doc, dict) and "candles" in doc:
+        if not name_hint:
+            raise ScanError("offline Kite candles without a symbol: name the file <TICKER>.json")
+        sym = plain_symbol(name_hint)
+        if doc["candles"]:
+            data[sym] = series_from_candles(doc["candles"])
+        else:
+            errors[sym] = "no candles for %s" % sym
     elif isinstance(doc, dict):
         for k, v in doc.items():
             _absorb(v, k, data, errors)
     else:
-        raise ScanError("offline file %s is not a spark answer, a v8 chart or a bundle" % name_hint)
+        raise ScanError("offline file %s is not Kite candles or a bundle of them" % name_hint)
 
 
 def load_offline(path):
-    """A folder of <T>.json(.gz) files or one file -> ({SYM: series}, {SYM: error})."""
+    """A folder of <T>.json(.gz) files or one bundle file -> ({SYM: series}, {SYM: error})."""
     data, errors = {}, {}
     if os.path.isdir(path):
         names = sorted(f for f in os.listdir(path) if f.endswith((".json", ".json.gz")))
@@ -368,10 +288,7 @@ def load_offline(path):
                 doc = json.loads(_read_maybe_gz(os.path.join(path, f)))
             except ValueError as e:
                 raise ScanError("%s is not valid JSON: %s" % (f, e))
-            if isinstance(doc, dict) and ("chart" in doc or "spark" in doc):
-                _absorb(doc, "" if "spark" in doc else _stem(f), data, errors)
-            else:
-                _absorb(doc, "", data, errors)
+            _absorb(doc, _stem(f), data, errors)
     elif os.path.isfile(path):
         try:
             doc = json.loads(_read_maybe_gz(path))
@@ -514,10 +431,10 @@ def scan_daily(data, symbols, now_utc, min_price, min_volume):
         counts["fetched"] += 1
         bars = daily_closes(s, now_utc)
         meta = s.get("meta") or {}
-        price = meta.get("regularMarketPrice")
+        price = meta.get("last")
         if price is None and bars:
             price = bars[-1][1]
-        vol = meta.get("regularMarketVolume")
+        vol = meta.get("volume")
         if price is None or price < min_price or (min_volume > 0 and (vol is None or vol < min_volume)):
             counts["illiquid"] += 1
             continue
@@ -647,18 +564,15 @@ def orb_window(now_utc, at, or_minutes, until, explicit_day=None):
     return day, cutoff
 
 
-def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume=0, confirm=None,
-             max_confirm=None):
-    """stage1 = {SYM: series} with closes (spark or v8). confirm(sym) -> series with highs/lows
-    (None = use the stage-1 series). With confirm and max_confirm, only the max_confirm most
-    traded candidates (price x volume so far) are confirmed; the rest are counted as unconfirmed.
+def scan_orb(data, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume=0):
+    """data = {SYM: series} of 5-minute Kite candles (real highs and lows).
     Returns (hits, counts, failed {sym: why})."""
     n_range = or_minutes // BAR_MIN
     counts = {"requested": len(symbols), "fetched": 0, "unusable": 0, "illiquid": 0, "scanned": 0,
-              "candidates": 0, "confirmed": 0, "unconfirmed": 0}
-    hits, failed, cands = [], {}, []
+              "candidates": 0, "confirmed": 0}
+    hits, failed = [], {}
     for sym in symbols:
-        s = stage1.get(sym)
+        s = data.get(sym)
         if not s:
             continue
         counts["fetched"] += 1
@@ -666,32 +580,16 @@ def scan_orb(stage1, symbols, day, cutoff, or_minutes, min_price=0.0, min_volume
         if not usable(bars, day, cutoff, n_range):
             counts["unusable"] += 1
             continue
-        vol = sum(b["v"] for b in bars) if s.get("v") else (s.get("meta") or {}).get("regularMarketVolume") or 0
+        vol = sum(b["v"] for b in bars)
         if bars[-1]["c"] < min_price or vol < min_volume:
             counts["illiquid"] += 1
             continue
         counts["scanned"] += 1
-        if orb_candidate(bars, n_range):
-            cands.append((sym, bars, bars[-1]["c"] * vol))
-    counts["candidates"] = len(cands)
-    if confirm is not None and max_confirm and len(cands) > max_confirm:
-        cands.sort(key=lambda x: -x[2])
-        counts["unconfirmed"] = len(cands) - max_confirm
-        cands = cands[:max_confirm]
-    for sym, bars, _ in cands:
-        full = bars
-        if confirm is not None:
-            try:
-                s2 = confirm(sym)
-            except ScanError as e:
-                failed[sym] = str(e)
-                continue
-            full = session_bars(s2, day, cutoff)
-            if not usable(full, day, cutoff, n_range):
-                failed[sym] = "the v8 chart has a missing bar"
-                continue
+        if not orb_candidate(bars, n_range):
+            continue
+        counts["candidates"] += 1
         counts["confirmed"] += 1
-        h = orb_hit(full, n_range)
+        h = orb_hit(bars, n_range)
         if h:
             hits.append(dict({"symbol": sym, "setups": ["orb"]}, **h))
     hits.sort(key=lambda x: (x["_t"], x["symbol"]))
@@ -708,27 +606,29 @@ def progress(a, msg):
         print(msg, file=sys.stderr)
 
 
-def fetch_spark(symbols, rng, interval, pause, a=None):
-    """Batches of 20. -> ({SYM: series}, {SYM: error})."""
+def fetch_candles(symbols, interval, frm, to, a=None):
+    """One Kite historical request per symbol (about 3 a second). -> ({SYM: series}, {SYM: error})."""
     data, failed = {}, {}
-    batches = [symbols[i:i + SPARK_MAX] for i in range(0, len(symbols), SPARK_MAX)]
-    for k, batch in enumerate(batches):
-        if k and pause:
-            SLEEP(pause)
-        wanted = {to_yahoo(s): s for s in batch}
+    try:
+        kite.access_token()
+    except kite.KiteError as e:
+        raise ScanError(str(e))
+    n = len(symbols)
+    for k, sym in enumerate(symbols):
         try:
-            got = parse_spark(yahoo_get(spark_path(batch, rng, interval)), wanted)
-        except (ScanError, ValueError) as e:
-            for s in batch:
-                failed[s] = str(e)
+            rows = kite.candles(sym, interval, frm=frm, to=to)
+        except kite.KiteError as e:
+            msg = str(e)
+            if "session" in msg or "api key" in msg or "TokenException" in msg:
+                raise ScanError(msg)
+            failed[sym] = msg
             continue
-        for s in batch:
-            if s in got:
-                data[s] = got[s]
-            else:
-                failed[s] = "no data from Yahoo"
-        if a is not None and len(batches) > 25 and (k + 1) % 50 == 0:
-            progress(a, "  spark %d of %d requests" % (k + 1, len(batches)))
+        if rows:
+            data[sym] = series_from_candles(rows)
+        else:
+            failed[sym] = "no candles from Kite"
+        if a is not None and n > 100 and (k + 1) % 100 == 0:
+            progress(a, "  %d of %d charts" % (k + 1, n))
     return data, failed
 
 
@@ -839,7 +739,7 @@ def cmd_universe(a):
             print("Dropped: " + ", ".join("%s %s" % ("{:,}".format(v), k)
                                           for k, v in sorted(dropped.items(), key=lambda kv: -kv[1])) + ".")
         if not a.no_write:
-            print("Wrote %s (one SYMBOL|Name a line; Yahoo is read as SYMBOL.NS)." % a.out)
+            print("Wrote %s (one SYMBOL|Name a line)." % a.out)
     return 0 if kept else 1
 
 
@@ -852,15 +752,17 @@ def cmd_daily(a):
         offline_syms = sorted(set(data) | set(failed))
     symbols = read_symbols(a, offline_syms)
     if not a.offline:
-        progress(a, "Fetching daily closes for %s symbols (%d spark requests)..."
-                 % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
+        progress(a, "Fetching daily candles from Kite for %s symbols (about %d seconds)..."
+                 % ("{:,}".format(len(symbols)), int(len(symbols) * kite.HIST_GAP) + 1))
+        local = to_ist(now)
+        data, failed = fetch_candles(symbols, "1d", local - datetime.timedelta(days=150), local, a)
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "source": "offline" if a.offline else "kite",
+           "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
@@ -870,8 +772,9 @@ def cmd_daily(a):
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
     local = to_ist(now)
-    print("Daily scan, %s IST, closes through %s (Yahoo spark, daily closes only)." % (
-        local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing"))
+    print("Daily scan, %s IST, closes through %s (%s daily candles, closes only)." % (
+        local.strftime("%a %Y-%m-%d %H:%M"), last_date.isoformat() if last_date else "nothing",
+        "saved" if a.offline else "Zerodha Kite"))
     print("Fetched %s of %s charts%s. %s passed the liquidity filter (₹%s+ and %s+ shares)%s; "
           "%s scanned." % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
                            (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
@@ -922,33 +825,18 @@ def cmd_orb(a):
                     raise ScanError("offline replay: give --at HH:MM or --now \"YYYY-MM-DD HH:MM\"")
     day, cutoff = orb_window(now, at, a.or_minutes, until, explicit_day)
     symbols = read_symbols(a, offline_syms)
-    confirm = None
     if not a.offline:
-        today = to_ist(parse_now(None)).date()
-        if (today - day).days > 6:
-            raise ScanError("Yahoo's free 5-minute history is short: replay %s with --offline" % day.isoformat())
-        rng = "1d" if day == today else "5d"
-        progress(a, "Stage 1: 5-minute closes for %s symbols (%d spark requests)..."
-                 % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
-        data, failed = fetch_spark(symbols, rng, "%dm" % BAR_MIN, a.pause, a)
-        done = []
-
-        def confirm(sym):
-            if a.pause:
-                SLEEP(a.pause)
-            done.append(sym)
-            if len(done) % 50 == 0:
-                progress(a, "  stage 2: %d v8 charts so far" % len(done))
-            return parse_chart(yahoo_get(chart_path(sym, rng, "%dm" % BAR_MIN)), sym)
-    hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume, confirm,
-                                     a.max_confirm)
+        progress(a, "5-minute candles from Kite for %s symbols (about %d seconds)..."
+                 % ("{:,}".format(len(symbols)), int(len(symbols) * kite.HIST_GAP) + 1))
+        data, failed = fetch_candles(symbols, "5m", datetime.datetime.combine(day, OPEN), cutoff, a)
+    hits, counts, failed2 = scan_orb(data, symbols, day, cutoff, a.or_minutes, a.min_price, a.min_volume)
     failed = dict(failed or {})
     failed.update(failed2)
     nfailed = len([s for s in symbols if s in failed])
     as_of = "%s %s IST" % (day.isoformat(), cutoff.strftime("%H:%M"))
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
+           "source": "offline" if a.offline else "kite", "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
     if a.offline:
@@ -958,21 +846,18 @@ def cmd_orb(a):
     if a.json:
         print(json.dumps(dict(doc, counts=counts, seconds=round(time.time() - t0, 1)), indent=2))
         return 0 if hits else 1
-    print("Opening-range breakout scan, %s %s IST: %d-minute range (9:15 to %s), 5-minute bars, Yahoo."
-          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN))))
-    print("Fetched %s of %s charts%s; %s usable%s; %s candidates, %s confirmed with real highs and lows."
+    print("Opening-range breakout scan, %s %s IST: %d-minute range (9:15 to %s), 5-minute candles, %s."
+          % (day_label(day), clock_label(cutoff), a.or_minutes, clock_label(slot(day, a.or_minutes // BAR_MIN)),
+             "saved" if a.offline else "Zerodha Kite"))
+    print("Fetched %s of %s charts%s; %s usable%s; %s closed at or above the range's highest close, %s checked against the range high (real highs and lows)."
           % ("{:,}".format(counts["fetched"]), "{:,}".format(len(symbols)),
              (" (%s failed or had no data)" % "{:,}".format(nfailed)) if nfailed else "",
              "{:,}".format(counts["scanned"]),
              (" (%s under the price / volume floor)" % "{:,}".format(counts["illiquid"])) if counts["illiquid"] else "",
              "{:,}".format(counts["candidates"]), "{:,}".format(counts["confirmed"])))
-    if counts["unconfirmed"]:
-        print("PARTIAL: %s more candidates were not checked (only the %s most traded are; --max-confirm 0 "
-              "checks all)." % ("{:,}".format(counts["unconfirmed"]), "{:,}".format(a.max_confirm)))
     if hits:
         print("%d of %s charts closed above their opening-range high by %s:"
-              % (len(hits), ("the %s checked" % "{:,}".format(counts["confirmed"])) if counts["unconfirmed"]
-                 else "{:,}".format(counts["scanned"]), clock_label(cutoff)))
+              % (len(hits), "{:,}".format(counts["scanned"]), clock_label(cutoff)))
         for h in hits[:a.show]:
             print("  %8s  %-6s %10s  range %s to %s  %+.2f%% over" % (
                 h["at"], h["symbol"], money(h["price"]), _p(h["or_low"]), _p(h["or_high"]), h["pct_over"]))
@@ -1000,7 +885,6 @@ def main(argv=None):
     p.add_argument("--out", default=DEFAULT_UNIVERSE)
     p.add_argument("--offline", metavar="PATH", help="a saved EQUITY_L.csv / ind_nifty*list.csv, or a folder with it")
     p.add_argument("--no-write", action="store_true")
-    p.add_argument("--pause", type=float, default=PAUSE)
     p.add_argument("--json", action="store_true")
 
     def common(p, min_price, min_volume):
@@ -1011,11 +895,10 @@ def main(argv=None):
         p.add_argument("--limit", type=int, help="scan only the first N symbols")
         p.add_argument("--min-price", type=float, default=min_price)
         p.add_argument("--min-volume", type=int, default=min_volume)
-        p.add_argument("--offline", metavar="PATH", help="fixture folder or file instead of the network")
+        p.add_argument("--offline", metavar="PATH", help="saved Kite candles (folder or bundle) instead of the network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" IST, or ...Z)')
         p.add_argument("--out", default="trader/watchlist.json")
         p.add_argument("--no-write", action="store_true")
-        p.add_argument("--pause", type=float, default=PAUSE, help="seconds between requests (%.1f)" % PAUSE)
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")
@@ -1025,8 +908,6 @@ def main(argv=None):
     p = sub.add_parser("orb", help="opening-range breakouts so far today")
     common(p, 5.0, 0)
     p.add_argument("--or-minutes", type=int, default=15)
-    p.add_argument("--max-confirm", type=int, default=MAX_CONFIRM,
-                   help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this IST, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 14:45)")
     p.add_argument("--config", default="trader/config.json")
