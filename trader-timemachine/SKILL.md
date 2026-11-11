@@ -68,6 +68,11 @@ bars), `--offline FILE` (saved Kite candles `{"candles": [...]}`, `.json` or `.j
    R is +1 at a 1R target, -1 at the stop, and otherwise the distance from
    the entry at `--until` divided by the risk. A gap through the stop still
    counts as -1R here. A real fill can be worse.
+   **Charges come off.** Zerodha's intraday round-trip charges (brokerage,
+   STT, exchange, SEBI, stamp, GST) for the share count your config allows
+   (`--qty` overrides) are turned into R and taken off every outcome. Average
+   R, the history's average R and the verdict's break-even share are all
+   after charges. With small orders they can cost 0.2R a trade: say so.
 4. **The history.** The plan's own rule (the same opening range, stop rule
    and target R) runs again on every one of those past sessions. That is
    what really happened, not a simulation.

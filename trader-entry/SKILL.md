@@ -64,9 +64,13 @@ day bar by bar without waiting.
 - **Only closed bars count.** A bar is closed when the clock passes its start
   plus 5 (or 1) minutes and Kite's last trade is at or past that moment (it
   waits a minute at most). The candle still forming is never a bar.
-- **Volume, if you want it.** `--min-volume-x 1.5` also needs the trigger
-  bar's volume at 1.5 times the range bars' average. The 9:15 bar holds the
-  opening auction, so 1.0 is already strict.
+- **Volume (on by default).** The trigger bar's volume must be at least 1.5
+  times the range bars' average (config `min_volume_x`; `--min-volume-x 0`
+  turns it off).
+- **VWAP (on by default).** The trigger bar must also close above the session
+  VWAP, (H+L+C)/3 weighted by volume from 9:15 (config `require_above_vwap`;
+  `--no-vwap` turns it off). The 9:15 bar holds the opening auction, so the
+  volume bar is high: on Nov 11 1.5x left 8 of the Nifty 50 triggering.
 - **Time limits.** No entries before 9:30 or after 14:45 (config), so
   there is time for the trade to work before the 15:15 flat-by and the broker's
   MIS square-off.

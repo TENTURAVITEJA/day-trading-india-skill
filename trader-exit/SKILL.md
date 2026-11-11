@@ -58,9 +58,10 @@ level`, `--offline FILE` (saved Kite candles `{"candles": [...]}` for an ATR sto
 
 A level setup has no opening range to lean on, so it needs a stop you name.
 
-- **Rounding.** The stop rounds AWAY from the entry to the cent (down, for a
-  long). Risk = entry minus stop. Target = entry + R x risk, rounded half up
-  to the cent. `2R` by default; `1R`, `1.5R` or `price:X` also work.
+- **Rounding.** Prices sit on the stock's NSE tick (from Kite's instrument
+  list, usually ₹0.05; `--tick` overrides), so Zerodha accepts the orders.
+  The stop rounds DOWN to the tick, away from the entry. Risk = entry minus
+  stop. Target = entry + R x risk, rounded to the nearest tick. `2R` by default; `1R`, `1.5R` or `price:X` also work.
 - **Refused, with the reason.** A stop at or above the entry. A target at or
   below it. A risk under 0.05% of the price: too tight to survive the
   spread, normal wiggle would stop you out. An entry.json that has not

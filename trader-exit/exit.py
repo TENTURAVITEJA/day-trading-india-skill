@@ -201,6 +201,27 @@ def floor_cents(x):
     return D(x).quantize(CENT, rounding=ROUND_FLOOR)
 
 
+def to_tick(x, tick, rounding):
+    """Round a price onto the exchange's tick grid (NSE equities: usually ₹0.05, some ₹0.01 or ₹0.10)."""
+    t = D(tick)
+    return ((D(x) / t).quantize(Decimal("1"), rounding=rounding) * t).quantize(CENT)
+
+
+def tick_for(sym, explicit=None, offline=False):
+    """(tick, where it came from). Kite's instrument list, else NSE's usual ₹0.05."""
+    if explicit is not None:
+        return D(explicit), "--tick"
+    if not offline:
+        try:
+            ex, ts = kite.split_symbol(sym)
+            ins = kite.instruments(ex).get(ts)
+            if ins and ins.get("tick"):
+                return D(ins["tick"]), "Kite"
+        except Exception:
+            pass
+    return Decimal("0.05"), "default"
+
+
 def money(x):
     return "₹%s" % format(D(x).quantize(CENT), ",f")
 
@@ -257,8 +278,9 @@ def r_label(r):
 
 
 def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=None, or_low=None,
-            atr=None, atr_bars=None):
-    """The stop, the target and the risk, in exact cents. Raises PlanError with the reason."""
+            atr=None, atr_bars=None, tick=None):
+    """The stop, the target and the risk, on the tick grid (stop rounded down, target to the
+    nearest tick). Raises PlanError with the reason."""
     e = cents(entry)
     if e <= 0:
         raise PlanError("the entry price must be above ₹0")
@@ -291,9 +313,10 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
             num(a.quantize(Decimal("0.0001"))), atr_bars, " (fewer than 14 so far)" if atr_bars < ATR_BARS else "")
     else:
         raise PlanError("unknown stop rule %r" % stop_rule)
-    stop = floor_cents(raw)
+    stop = to_tick(raw, tick, ROUND_FLOOR) if tick else floor_cents(raw)
     if stop != D(raw):
-        detail = (detail + ", rounded down" if detail else "₹%s rounded down" % num(raw))
+        what = "rounded down to the ₹%s tick" % num(tick) if tick else "rounded down"
+        detail = (detail + ", " + what if detail else "₹%s %s" % (num(raw), what))
     if stop >= e:
         raise PlanError("the stop %s (%s) is at or above the entry %s: a long's stop goes under the entry"
                         % (money(stop), label, money(e)))
@@ -306,11 +329,12 @@ def compute(entry, stop_rule, stop_param, target_rule, target_param, or_high=Non
                         "survive the spread, normal wiggle would stop you out. Widen it."
                         % (money(risk), money(floor_risk.quantize(CENT, rounding=ROUND_HALF_UP)), money(e)))
     if target_rule == "r":
-        target = cents(e + target_param * risk)
+        raw_t = e + target_param * risk
         t_label = r_label(target_param)
     else:
-        target = cents(target_param)
+        raw_t = target_param
         t_label = None
+    target = to_tick(raw_t, tick, ROUND_HALF_UP) if tick else cents(raw_t)
     if target <= e:
         raise PlanError("the target %s is at or below the entry %s: a long's target goes above it"
                         % (money(target), money(e)))
@@ -530,8 +554,9 @@ def build_plan(a, now_utc):
             raise PlanError("an atr stop needs at least 3 closed %s bars of %s on %s by the entry; found %d"
                             % (info["interval"], info["symbol"], day, len(bars)))
         atr, atr_n = atr_of(bars)
+    tick, tick_src = tick_for(info["symbol"], getattr(a, "tick", None), offline=bool(a.offline))
     c = compute(info["entry"], stop_rule, stop_param, target_rule, target_param, info["or_high"], info["or_low"],
-                atr, atr_n)
+                atr, atr_n, tick)
     flat_by, flat_note = resolve_flat_by(day, a.flat_by, cfg, entry_time)
     orr = None
     if info["or_high"] is not None and info["or_low"] is not None:
@@ -544,7 +569,7 @@ def build_plan(a, now_utc):
             "stop": float(c["stop"]), "stop_rule": stop_rule, "stop_label": c["stop_label"],
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
-            "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+            "stop_detail": c["stop_detail"], "tick": float(tick), "tick_source": tick_src, "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
@@ -652,6 +677,7 @@ def main(argv=None):
     p.add_argument("--flat-by", help="HH:MM IST (default: config flat_by, 15:15)")
     p.add_argument("--config", default="trader/config.json")
     p.add_argument("--offline", metavar="PATH", help="saved Kite candles JSON for an atr stop")
+    p.add_argument("--tick", type=float, help="price tick (default: Kite's tick for the symbol, else 0.05)")
     p.add_argument("--now", help='pretend it is this IST, e.g. "2026-11-11 10:20"')
     p.add_argument("--write", nargs="?", const="trader/plan.json", metavar="PATH",
                    help="save the plan (default trader/plan.json)")

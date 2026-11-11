@@ -18,7 +18,11 @@ Setups (v2 plans longs only):
          20-day high from trader-scanner).
   --min-volume-x X  the trigger bar also needs at least X times the average
          volume of the opening-range bars (the 9:15 bar carries the opening
-         auction, so 1.0 is already a high bar).
+         auction, so 1.0 is already a high bar). Default 1.5 (config
+         "min_volume_x"); --min-volume-x 0 turns it off.
+  VWAP   the trigger bar must also CLOSE above the session VWAP (the volume-
+         weighted average of the typical price (H+L+C)/3 from 9:15 through that
+         bar). On by default (config "require_above_vwap"); --no-vwap turns it off.
 
 A trigger's time is the trigger bar's CLOSE time (the 10:10 bar closes at
 10:15 AM) and its price is that close, to the cent. Only bars on the interval
@@ -80,6 +84,7 @@ GRACE = 2        # seconds after a bar closes before watch asks for it
 SETTLE = 60      # seconds a closed bar may wait for Kite's candle to catch up
 INTERVALS = {"1m": 60, "5m": 300}
 DEFAULTS = {"no_entries_before": "09:30", "no_entries_after": "14:45"}
+FILTER_DEFAULTS = {"min_volume_x": 1.5, "require_above_vwap": True}
 EPOCH = datetime.datetime(1970, 1, 1)
 
 NSE_HOLIDAYS = {
@@ -325,8 +330,18 @@ def read_config(path):
         for k in DEFAULTS:
             if doc.get(k):
                 cfg[k] = doc[k]
+        for k in FILTER_DEFAULTS:
+            if k in doc and doc[k] is not None:
+                cfg[k] = doc[k]
     for k in DEFAULTS:
         parse_hhmm(cfg[k], k)
+    for k, v in FILTER_DEFAULTS.items():
+        cfg.setdefault(k, v)
+    try:
+        cfg["min_volume_x"] = float(cfg["min_volume_x"])
+    except (TypeError, ValueError):
+        raise EntryError("config min_volume_x must be a number (0 turns the volume check off)")
+    cfg["require_above_vwap"] = bool(cfg["require_above_vwap"])
     return cfg
 
 
@@ -346,7 +361,7 @@ def early_cutoff(day, t, close_dt):
 
 
 def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=None,
-             min_volume_x=None, cfg=None):
+             min_volume_x=None, cfg=None, vwap_filter=False):
     """Pure function: the setup's status at now_utc from one session's bars."""
     cfg = cfg or dict(DEFAULTS)
     if interval not in INTERVALS:
@@ -364,7 +379,7 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res = {"symbol": plain_symbol(chart["symbol"]), "setup": setup, "side": "buy", "date": day.isoformat(),
            "interval": interval, "or_minutes": or_minutes, "now": local.strftime("%Y-%m-%d %H:%M:%S"), "status": "waiting",
            "phase": "", "reason": "", "opening_range": None, "level": None, "trigger": None,
-           "last": None, "forming": None, "min_volume_x": min_volume_x,
+           "last": None, "forming": None, "min_volume_x": min_volume_x, "vwap_filter": bool(vwap_filter),
            "prev_close": chart.get("prev_close"), "calendar_known": day.year in CALENDAR_YEARS, "_bars": []}
     dt = chart.get("data_time")
     res["data_time"] = to_ist(utc_of(dt)).strftime("%Y-%m-%d %H:%M:%S") if dt else None
@@ -439,7 +454,14 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     res["level"] = r2(lvl)
 
     first_slot = n_or if setup == "orb" else 0
-    trig, thin = None, []
+    trig, thin, under_vwap = None, [], []
+    pv = cv = 0.0
+    for b in bars:                          # session VWAP through each closed bar
+        pv += (b["h"] + b["l"] + b["c"]) / 3.0 * b["v"]
+        cv += b["v"]
+        b["vwap"] = (pv / cv) if cv else None
+    if bars:
+        res["vwap"] = r2(bars[-1]["vwap"])
     for b in bars:
         if b["slot"] < first_slot or b["end"] < before or b["end"] > cutoff:
             continue
@@ -447,6 +469,9 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
             vx = (b["v"] / avg_vol) if avg_vol else None
             if min_volume_x and (vx is None or vx < min_volume_x):
                 thin.append(b)
+                continue
+            if vwap_filter and b["vwap"] is not None and b["c"] <= b["vwap"]:
+                under_vwap.append(b)
                 continue
             trig = b
             break
@@ -461,7 +486,8 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                    reason="the %s bar closed above %s" % (short(trig["et"]), "the range high" if setup == "orb" else "the level"))
         res["trigger"] = {"time": ampm(trig["end"]), "close_time": hm(trig["end"]), "bar_start": hm(trig["et"]),
                           "bar_index": trig["slot"], "price": r2(trig["c"]), "close": trig["c"],
-                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1))}
+                          "volume": trig["v"], "volume_x": r2(vx), "pct_over": r2(100.0 * (trig["c"] / lvl - 1)),
+                          "vwap": r2(trig.get("vwap"))}
         res["minutes_since"] = int((local - trig["end"]).total_seconds() // 60)
         if dt and utc_of(dt) < ist_to_utc(trig["end"]):
             res["data_note"] = ("Kite's last trade is %s, before this bar closed: its close can still move a cent or two"
@@ -477,7 +503,10 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
                        what, short(cutoff), " (1:00 p.m. early close today)" if early else ""))
         return res
     res["phase"] = "open"
-    if last["c"] > lvl and last in thin:
+    if last["c"] > lvl and last in under_vwap:
+        res["reason"] = "the %s bar closed above at ₹%.2f but not above the session VWAP ₹%.2f" % (
+            short(last["et"]), last["c"], last["vwap"])
+    elif last["c"] > lvl and last in thin:
         res["reason"] = "the %s bar closed above at ₹%.2f but on %.2fx the range's volume, under your %.2fx" % (
             short(last["et"]), last["c"], last["v"] / avg_vol if avg_vol else 0, min_volume_x)
     elif last["c"] > lvl and last["end"] < before:
@@ -554,6 +583,8 @@ def describe(res):
             t["time"], t["price"], short(datetime.datetime.strptime(t["bar_start"], "%H:%M")), t["bar_index"],
             "the range high" if res["setup"] == "orb" else "the level", res["level"], t["pct_over"],
             (", %.2fx the range's volume" % t["volume_x"]) if res.get("min_volume_x") and t.get("volume_x") else ""))
+        if res.get("vwap_filter") and t.get("vwap"):
+            out.append("Closed above the session VWAP ₹%.2f." % t["vwap"])
         step = INTERVALS[res["interval"]] // 60
         if res.get("minutes_since", 0) > step and res.get("last"):
             out.append("That was %d minutes ago; the last close is ₹%.2f (%s bar). A late entry is a different "
@@ -608,8 +639,10 @@ def bar_line(b, res):
         note = "above ₹%.2f" % lvl
         if res["setup"] == "level" or b["slot"] >= n_or:
             avg = orr.get("avg_volume")
-            if res.get("min_volume_x") and avg:
+            if res.get("min_volume_x") and avg and b["v"] / float(avg) < res["min_volume_x"]:
                 note += ", but volume %.2fx is under %.2fx" % (b["v"] / float(avg), res["min_volume_x"])
+            elif res.get("vwap_filter") and b.get("vwap") and b["c"] <= b["vwap"]:
+                note += ", but not above VWAP ₹%.2f" % b["vwap"]
             elif b["end"] < datetime.datetime.combine(b["et"].date(), parse_hhmm(res["no_entries_before"], "x")):
                 note += ", but no entries before %s" % res["no_entries_before"]
     else:
@@ -726,12 +759,13 @@ def _opts(a, cfg):
         raise EntryError("v2 plans longs only: no short entries. Watch for a buy (--side buy) instead.")
     if a.setup == "orb" and a.level is not None:
         raise EntryError("--level is for --setup level (an orb's level is its range high)")
-    if a.min_volume_x is not None and a.min_volume_x <= 0:
-        raise EntryError("--min-volume-x must be above 0")
+    if a.min_volume_x is not None and a.min_volume_x < 0:
+        raise EntryError("--min-volume-x must be 0 (off) or above")
     if a.level is not None and a.level <= 0:
         raise EntryError("--level must be a price above 0")
     return {"setup": a.setup, "or_minutes": a.or_minutes, "interval": a.interval, "level": a.level,
-            "min_volume_x": a.min_volume_x, "cfg": cfg}
+            "min_volume_x": (cfg["min_volume_x"] if a.min_volume_x is None else a.min_volume_x) or None,
+            "vwap_filter": cfg["require_above_vwap"] and not a.no_vwap, "cfg": cfg}
 
 
 def _load(a, sym, now):
@@ -860,7 +894,9 @@ def main(argv=None):
         p.add_argument("--or-minutes", type=int, default=15, help="opening range length (default 15)")
         p.add_argument("--interval", choices=["5m", "1m"], default="5m")
         p.add_argument("--level", type=float, help="the price to close above (--setup level)")
-        p.add_argument("--min-volume-x", type=float, help="trigger bar volume vs the range bars' average")
+        p.add_argument("--min-volume-x", type=float,
+                       help="trigger bar volume vs the range bars' average (default 1.5 or config; 0 = off)")
+        p.add_argument("--no-vwap", action="store_true", help="do not require the trigger bar to close above VWAP")
         p.add_argument("--side", default="buy", choices=["buy", "long", "sell", "short"], help="v2: buy only")
         p.add_argument("--now", help='pretend it is this IST, e.g. "2026-11-11 10:20"')
         p.add_argument("--offline", metavar="PATH", help="saved Kite candles JSON (.json/.json.gz) or a folder")

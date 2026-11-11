@@ -32,6 +32,12 @@ How the replays work (same algorithm and random draws as the original pack's sim
      R = the target's R at the target, -1 at the stop, otherwise
      (price at --until - entry) / risk. A gap through the stop still counts
      -1R here; a real fill can be worse.
+     Net R takes off Zerodha's intraday round-trip charges (brokerage
+     min(Rs 20, 0.03%) an order, STT 0.025% on the sell, NSE fee 0.00297%,
+     SEBI Rs 10 a crore, stamp 0.003% on the buy, GST 18%) for the share count
+     your config allows (trader/config.json: max_order_inr, budget,
+     cash_buffer_pct, max_position_pct, max_loss_per_trade_inr; or --qty),
+     divided by that count and the risk a share. The verdict reads net R.
   5. The price at --until: median and the 5th to 95th percentile of all
      replays (pct(a, q) = sorted a at index int(q * n)). The fan chart uses a
      second run of 2,000 paths with the same seed. The histogram has 24 bins
@@ -397,6 +403,42 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
+def intraday_charges(qty, buy, sell):
+    """Zerodha equity intraday (MIS) charges for one round trip, in rupees (same as trader-budget)."""
+    b, s_ = qty * buy, qty * sell
+    brokerage = min(20.0, 0.0003 * b) + min(20.0, 0.0003 * s_)
+    stt = 0.00025 * s_
+    exch = 0.0000297 * (b + s_)
+    sebi = 10.0 / 1e7 * (b + s_)
+    stamp = 0.00003 * b
+    gst = 0.18 * (brokerage + exch + sebi)
+    return brokerage + stt + exch + sebi + stamp + gst
+
+
+def shares_from_config(cfg, entry, risk):
+    """The whole shares trader-budget would buy: the order cap, the position cap after the cash
+    buffer, and the max loss at the stop. At least 1."""
+    caps = []
+    if cfg.get("max_order_inr"):
+        caps.append(float(cfg["max_order_inr"]) / entry)
+    if cfg.get("budget"):
+        investable = float(cfg["budget"]) * (1 - float(cfg.get("cash_buffer_pct") or 0) / 100.0)
+        caps.append(investable * float(cfg.get("max_position_pct") or 100) / 100.0 / entry)
+    if cfg.get("max_loss_per_trade_inr") and risk > 0:
+        caps.append(float(cfg["max_loss_per_trade_inr"]) / risk)
+    q = int(math.floor(min(caps))) if caps else 1
+    return max(1, q)
+
+
+def costs(entry, stop, target, close_med, qty, long=True):
+    """Round-trip charges in R, at the target, at the stop and at a typical close."""
+    risk = (entry - stop) if long else (stop - entry)
+    per = lambda x: intraday_charges(qty, entry, x) / qty / risk
+    return {"qty": qty, "target": per(target), "stop": per(stop), "close": per(close_med),
+            "rupees_at_target": round(intraday_charges(qty, entry, target), 2),
+            "rupees_at_stop": round(intraday_charges(qty, entry, stop), 2)}
+
+
 def history_replay(sessions, rule, last, side="buy"):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
@@ -585,6 +627,9 @@ def lean(mc):
         return None
     r = mc.get("r_at_target") or 1.0
     share, even = pt / (pt + ps), 1.0 / (1.0 + r)
+    if mc.get("r_at_target_net") is not None and mc.get("r_at_stop_net") is not None:
+        win, loss = mc["r_at_target_net"], -mc["r_at_stop_net"]       # after charges
+        even = loss / (win + loss) if win > 0 else 1.0
     return share - even, share, even
 
 
@@ -607,8 +652,8 @@ def verdict(mc):
     odds = "target first %.1f %% vs stop first %.1f %%" % (100 * pt, 100 * ps)
     if one_r:
         return "%s: %s." % (head, odds)
-    return ("%s: at %gR the target has to come first in %.0f %% of the replays that hit one side; "
-            "it did in %.0f %% (%s)." % (head, round(r, 2), 100 * even, 100 * share, odds))
+    return ("%s: at %gR, after charges, the target has to come first in %.0f %% of the replays that hit one "
+            "side; it did in %.0f %% (%s)." % (head, round(r, 2), 100 * even, 100 * share, odds))
 
 
 def verdict_notes(mc):
@@ -674,11 +719,34 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
+    risk = abs(plan["entry"] - plan["stop"])
+    qty = plan.get("qty") or shares_from_config(plan.get("_cfg") or {}, plan["entry"], risk)
+    cst = costs(plan["entry"], plan["stop"], plan["target"], mc["median_close"], qty, plan["side"] == "buy")
+    cost_R = (mc["p_target"] * cst["target"] + mc["p_stop"] * cst["stop"] + mc["p_neither"] * cst["close"])
+    mc["gross_avg_R"] = mc["avg_R"]
+    mc["cost_R"] = round(cost_R, 3)
+    mc["avg_R"] = round(mc["avg_R"] - cost_R, 3)
+    mc["charges"] = {"qty": qty, "at_target": cst["rupees_at_target"], "at_stop": cst["rupees_at_stop"],
+                     "cost_R_at_target": round(cst["target"], 3), "cost_R_at_stop": round(cst["stop"], 3)}
+    # net R: the target pays less, the stop costs more. The break-even share moves with it.
+    mc["r_at_target_net"] = round(mc["r_at_target"] - cst["target"], 3)
+    mc["r_at_stop_net"] = round(-1.0 - cst["stop"], 3)
     rule = resolve_rule(plan, entry_day)
-    plan_out = {kk: v for kk, v in plan.items() if v is not None}
+    plan_out = {kk: v for kk, v in plan.items() if v is not None and not kk.startswith("_")}
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
         history = history_replay(sessions, rule, last, plan["side"])
+        if history.get("trades"):
+            nets = []
+            for t in history["trades"]:
+                rk = abs(t["entry"] - t["stop"])
+                q = plan.get("qty") or shares_from_config(plan.get("_cfg") or {}, t["entry"], rk)
+                ex = t["target"] if t["outcome"] == "target" else t["stop"] if t["outcome"] == "stop" else t["entry"]
+                t["R_net"] = round(t["R"] - intraday_charges(q, t["entry"], ex) / q / rk, 2)
+                nets.append(t["R_net"])
+            history["gross_avg_R"] = history["avg_R"]
+            history["avg_R"] = round(statistics.mean(nets), 3)
+            history["green"] = sum(1 for x in nets if x > 0)
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
@@ -731,8 +799,11 @@ def report(doc):
         "",
         "  Price at %s: median %.2f, 90 %% of replays between %.2f and %.2f."
         % (until, m["median_close"], m["p5_close"], m["p95_close"]),
-        "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
-        % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        "  Average R after charges: %+.3f (before charges %+.3f; R = the %.2f risk: %sR at the target, -1R at the stop)."
+        % (m["avg_R"], m.get("gross_avg_R", m["avg_R"]), p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
+        "  Charges for %d shares: about ₹%.2f a round trip at the target, ₹%.2f at the stop (%.2fR to %.2fR)."
+        % (m["charges"]["qty"], m["charges"]["at_target"], m["charges"]["at_stop"],
+           m["charges"]["cost_R_at_target"], m["charges"]["cost_R_at_stop"]) if m.get("charges") else "",
         "",
     ]
     if h.get("rule"):
@@ -742,7 +813,7 @@ def report(doc):
                                                            "%.2f %% from the entry" % ru.get("stop_pct", 0))
         if h["triggered"]:
             lines.append("History: the same rule (%d-min opening range, stop at the %s, %gR target) on each of "
-                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
+                         "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R after charges %+.3f."
                          % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
                             h["target"], h["stop"], h["close"], h["avg_R"]))
         else:
@@ -816,9 +887,21 @@ def _write(path, doc):
         fh.write("\n")
 
 
+def read_cfg(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        return doc if isinstance(doc, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def compute(a):
     now = parse_now(a.now)
     plan = load_plan(a, now)
+    plan["_cfg"] = read_cfg(a.config)
+    if a.qty:
+        plan["qty"] = a.qty
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
@@ -879,6 +962,8 @@ def main(argv=None):
         p.add_argument("--window", type=int, default=2, help="draw from the same time of day +- this many bars")
         p.add_argument("--until", help="end each replay at this time (default 15:15, the flat-by time)")
         p.add_argument("--offline", metavar="FILE", help="saved Kite candles JSON (.json or .json.gz), no network")
+        p.add_argument("--config", default="trader/config.json", help="limits for the share count used for charges")
+        p.add_argument("--qty", type=int, help="share count for the charges (default: what your config allows)")
         p.add_argument("--now", help='pretend it is this time ("2026-11-11 10:20" IST, or ISO with Z)')
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
