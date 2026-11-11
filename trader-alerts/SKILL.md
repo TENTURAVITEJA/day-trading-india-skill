@@ -4,13 +4,13 @@ description: >-
   Price Alerts. Rings when a price, a stop or the opening bell hits. Turns
   the trade plan into three alerts in one go (the stop, the target and "flat
   by close" at your flat-by time), plus above / below / stop / target levels,
-  percent moves from the previous close, any time of day, and the NYSE
-  opening bell, each ringing once so you are not spammed. Knows NYSE hours
-  with the 2026 and 2027 holidays and 1:00 p.m. early closes, works out New
-  York time itself, fetches free delayed quotes (Yahoo chart JSON, Stooq
-  CSV) one ticker at a time, and writes trader/prices.json for sizing and the
-  risk check. Use when the user says "alert me when", "tell me if TSLA hits",
-  "watch my stop", "watch my trade", "remind me to close by 3:55", "is the
+  percent moves from the previous close, any time of day, and NSE
+  opening bell, each ringing once so you are not spammed. Knows NSE hours
+  (9:15 AM to 3:30 PM IST) with the 2026 trading holidays, works out IST
+  itself, fetches free delayed quotes for NSE/BSE stocks (Yahoo chart JSON,
+  SYMBOL.NS / CODE.BO) one ticker at a time, and writes trader/prices.json for sizing and the
+  risk check. Use when the user says "alert me when", "tell me if ADANIENT hits",
+  "watch my stop", "watch my trade", "remind me to close by 3:15", "is the
   market open", "when does the market open", "get me a price", or right
   after /trader-exit writes a plan.
 argument-hint: "[ticker] [price]"
@@ -27,21 +27,21 @@ user what happened and when it is time to be flat.
 `${CLAUDE_SKILL_DIR}` below is this skill's folder (where this SKILL.md lives).
 
 ```bash
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NYSE open or closed, next open
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" clock                          # NSE open or closed, next open
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --from-plan                # stop, target, flat by close from trader/plan.json
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --opening-bell
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol TSLA --stop 358.32
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol TSLA --target 370.04
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --at 15:55 --label "flat by close" --before-close
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol ADANIENT --stop 2737.75
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol ADANIENT --target 2830.00
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --at 15:15 --label "flat by close" --before-close
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" add --symbol KO --pct 3
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" check                          # exit 0 = something rang
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote TSLA --write             # -> trader/prices.json
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote ADANIENT --write             # -> trader/prices.json
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" quote --holdings --write       # portfolio + plan tickers
 python3 "${CLAUDE_SKILL_DIR}/alerts.py" list
-python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset tsla-plan-stop
+python3 "${CLAUDE_SKILL_DIR}/alerts.py" reset adanient-plan-stop
 ```
 
-`--now "2026-10-19 15:55"` pins the clock (New York time); `--offline DIR`
+`--now "2026-11-11 15:15"` pins the clock (IST); `--offline DIR`
 reads saved quote files instead of the network.
 
 ## What it reads and writes
@@ -61,45 +61,42 @@ reads saved quote files instead of the network.
 | `above` / `target` | price at or above `price` | after `reset`, or on its own if `"rearm": true` and the price fell back |
 | `below` / `stop` | price at or below `price` | same |
 | `pct_move` | moved `pct` percent from the previous close (or `ref`), optional `direction` up or down | once per day at most |
-| `time` | the New York clock passed `at` ("15:55") on a trading day | once per trading day |
-| `opening_bell` | the NYSE is open | once per trading day |
+| `time` | the IST clock passed `at` ("15:15") on a trading day | once per trading day |
+| `opening_bell` | NSE is open | once per trading day |
 
-A rule with `"date"` is watched on that New York date only; `--from-plan`
-rules carry the plan's date, so yesterday's stop never rings today. A `time`
-rule with `"before_close": true` moves 3 hours earlier on a 1:00 p.m. early
-close, so "flat by close" at 15:55 rings at 12:55 on those days.
+A rule with `"date"` is watched on that IST date only; `--from-plan`
+rules carry the plan's date, so yesterday's stop never rings today. NSE has no
+scheduled half days, so `"before_close"` changes nothing. Keep "flat by
+close" at 15:15: Zerodha starts auto squaring-off MIS positions around 15:20.
 
 ## Quotes
 
-- `yahoo` (default): `query2.finance.yahoo.com/v8/finance/chart/<TICKER>`, an
+- `yahoo` (default): `query2.finance.yahoo.com/v8/finance/chart/<SYMBOL>.NS`, an
   unofficial free JSON endpoint, one request per ticker, half a second apart.
   On a 429 it waits and tries once more; on a 429 or a 5xx after that it
-  tries `query1`. It identifies itself as `day-trader-skill/2.0`.
-- `stooq`: `stooq.com/q/l/?s=tsla.us&f=sd2t2ohlcv&h&e=csv`, Stooq's free CSV.
-  It answered 404 on 2026-10-13; the parser stays for when it is back.
+  tries `query1`. It identifies itself as `day-trader-skill-india/2.0`.
+- Stooq has no reliable Indian coverage; use `yahoo`.
 - Free quotes are unofficial, delayed and can lag. They are fine for alerts
   and for checking a size, not for timing an order. The broker's price is the
   one that fills. Each price in `trader/prices.json` keeps its quote time, and
   trader-risk only uses one under 15 minutes old.
-- If both are down, read the price from the broker connector (Alpaca
-  `get_stock_snapshot`, IBKR `get_price_snapshot`) and write it into
-  `trader/prices.json` as `{"as_of": "...Z", "prices": {"TSLA": 366.48}}`.
+- If both are down, read the price from the broker connector (Kite
+  `get_ltp` or `get_quotes` with `NSE:ADANIENT`) and write it into
+  `trader/prices.json` as `{"as_of": "...Z", "prices": {"ADANIENT": 2752.70}}`.
 
-## The NYSE clock
+## The NSE clock
 
-Regular session 9:30 a.m. to 4:00 p.m. New York time, closed on weekends and
-on these holidays, from nyse.com/markets/hours-calendars (read 2026-10-13):
+Pre-open 9:00 to 9:08 a.m., regular session 9:15 a.m. to 3:30 p.m. IST
+(NSE and BSE), closed on weekends and on the NSE trading holidays for 2026:
+Jan 26, Mar 3, Mar 26, Mar 31, Apr 3, Apr 14, May 1, May 28, Jun 26, Sep 14,
+Oct 2, Oct 20, Nov 10, Nov 24, Dec 25. Muhurat trading (Diwali, Nov 8 2026)
+is a special one-hour evening session announced by circular; the tool does
+not treat it as a regular session.
 
-- 2026: Jan 1, Jan 19, Feb 16, Apr 3 (Good Friday), May 25, Jun 19, Jul 3
-  (Independence Day observed), Sep 7, Nov 26, Dec 25. Early close 1:00 p.m. on
-  Nov 27 and Dec 24.
-- 2027: Jan 1, Jan 18, Feb 15, Mar 26 (Good Friday), May 31, Jun 18
-  (Juneteenth observed), Jul 5 (Independence Day observed), Sep 6, Nov 25,
-  Dec 24 (Christmas observed). Early close 1:00 p.m. on Nov 26.
-
-Daylight saving time is worked out in the tool, so it needs no time zone
-files and ignores the computer's own zone. For any other year it says the
-holiday list is unknown.
+IST is UTC+5:30 all year (no daylight saving), worked out in the tool, so the
+computer's own time zone does not matter. For 2027 add NSE's list to the code
+(usually published in December); until then the clock says the holiday list
+is unknown.
 
 ## Steps
 
@@ -110,32 +107,32 @@ holiday list is unknown.
    rules and rings each alert once. A check reads the latest delayed quote;
    it is not a live feed, and a price can pass a level between two checks.
 3. Tell the user what rang in one line each. A stop or target alert means the
-   bracket order has probably filled: check `get_open_position` and record the
+   SL-M stop has probably filled: check Kite `get_positions` and record the
    fill with trader-broker. "Flat by close" means close anything still open:
    trader-broker `flatten`, then trader-risk, then the user's yes. Never act
    for them.
 
-## Example: the reel
+## Example
 
-TSLA on Monday 2026-10-19: entry 364.18 at 10:15 AM, stop 358.32, target
-370.04, flat by 15:55. `add --from-plan` writes `tsla-plan-stop`,
-`tsla-plan-target` and `tsla-flat-by` for that day. A `check` at 10:53 reads
-the real 10:52 quote, 366.48, between the stop and the target:
-
-```
-NYSE OPEN (2026-10-19 10:53 New York, regular session).
-Nothing hit. 3 rule(s) watched today, TSLA $366.48.
-```
-
-At 3:55 PM:
+ADANIENT on Wednesday 2026-11-11 (real data): entry 2,768.50 at 10:20 AM, stop
+2,737.75, target 2,830.00, flat by 15:15. `add --from-plan` writes
+`adanient-plan-stop`, `adanient-plan-target` and `adanient-flat-by` for that
+day. A `check` at 10:57 reads the latest quote, between the stop and the target:
 
 ```
-ALERT Flat by close: it is 15:55 New York (set for 15:55), the market closes at 16:00. If TSLA is still
-open, close it: trader-broker flatten --symbol TSLA builds the sell ticket, then trader-risk and your yes.
+NSE OPEN (2026-11-11 10:57 IST, regular session).
+Nothing hit. 3 rule(s) watched today, ADANIENT ₹2752.70.
+```
+
+At 3:15 PM:
+
+```
+ALERT Flat by close: it is 15:15 IST (set for 15:15), the market closes at 15:30. If ADANIENT is still
+open, close it: trader-broker flatten --symbol ADANIENT builds the sell ticket, then trader-risk and your yes.
 ```
 
 It rings once. The next morning the plan's three alerts are no longer
-watched; with `add --opening-bell`, the bell rings at 9:30.
+watched; with `add --opening-bell`, the bell rings at 9:15.
 
 ## Rules
 

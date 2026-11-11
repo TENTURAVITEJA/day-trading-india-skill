@@ -1,32 +1,33 @@
 ---
 name: trader-broker
 description: >-
-  Order Executor. Sends approved orders to your broker, paper trading by
-  default, never without your yes. Shows each order as a plain ticket (a
-  bracket shows its stop-loss, take-profit and the max loss at the stop)
-  plus the exact JSON for Alpaca's place_stock_order, records your yes word
-  for word, then Claude's own Allow once / Deny card asks again. Builds the
-  sell ticket that closes a day trade by your flat-by time, records fills,
-  and logs each trade's max loss so trader-risk can hold the daily limit.
-  Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
-  default, keys in env vars, never in chat), the Interactive Brokers
-  connector, and setting order tools to "Needs approval". Use when the user
-  says "place the order", "buy it", "execute", "send it to my broker",
-  "close my position", "flatten", "get me out", "connect Alpaca", "set up
-  paper trading", or after /trader-risk passes.
+  Order Executor for Indian stocks (NSE/BSE). Sends approved orders to your
+  broker (Zerodha Kite, through Zerodha's official Kite MCP server), paper
+  mode by default, never without your yes. Shows each order as a plain ticket
+  (the MIS buy, the SL-M protective stop, the target that trader-alerts
+  watches, and the max loss at the stop) plus the exact Kite place_order
+  calls, records your yes word for word, then Claude's own Allow once / Deny
+  card asks again. Builds the sell ticket that squares off an intraday trade
+  by your flat-by time (before Zerodha's ~3:20 PM auto square-off), records
+  fills, and logs each trade's max loss so trader-risk can hold the daily
+  limit. Covers connecting Kite MCP, logging in without sharing passwords,
+  and setting order tools to "Needs approval". Use when the user says "place
+  the order", "buy it", "execute", "send it to Zerodha", "square off",
+  "close my position", "flatten", "get me out", "connect Kite", or after
+  /trader-risk passes.
 argument-hint: "[order number]"
 ---
 
 # trader-broker
 
 The Order Executor is the only skill in this pack that can lead to a real
-order, so it is the strictest. An order reaches the market only after three
+order, so it is the strictest. An order reaches NSE/BSE only after three
 separate gates, every time, for every order:
 
 1. **trader-risk passed this exact order today** (matched by fingerprint).
 2. **The user typed an explicit yes for this one order** in the chat.
 3. **The user clicked Allow once** on Claude's own permission card, which
-   appears because the order tool is set to "Needs approval".
+   appears because the Kite order tools are set to "Needs approval".
 
 Two yeses from the user, one PASS from the rules. No yes, no order.
 
@@ -35,15 +36,23 @@ Two yeses from the user, one PASS from the rules. No yes, no order.
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" show                     # every ticket, READY or not
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" approve --index 1 --reply "yes"
-python3 "${CLAUDE_SKILL_DIR}/ticket.py" result --index 1 --status placed --broker-id ID --filled-qty 8 --filled-price 364.20
-python3 "${CLAUDE_SKILL_DIR}/ticket.py" fill --symbol TSLA --side sell --qty 8 --price 370.04
-python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol TSLA --qty 8
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" result --index 1 --status placed --broker-id ID --filled-qty 16 --filled-price 2768.50
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" fill --symbol ADANIENT --side sell --qty 16 --price 2737.75
+python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol ADANIENT --qty 16
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
 ```
 
 `ticket.py` never talks to a broker. It renders tickets, checks that a reply
-is a real yes for that order, builds the flatten ticket, and keeps the log in
-`trader/state/broker.json`. `--now "2026-10-19 10:15"` pins the clock (New York time).
+is a real yes for that order, builds the square-off ticket, and keeps the log
+in `trader/state/broker.json`. `--now "2026-11-11 09:45"` pins the clock (IST).
+
+## Paper mode (the default)
+
+Zerodha has **no paper-trading account**. So `"paper": true` (the default in
+`trader/config.json`) means: nothing is ever sent to Kite. After the user's
+yes, record a simulated fill at the current price with `ticket.py fill`, and
+track the trade with trader-alerts exactly as if it were live. The user flips
+`"paper": false` themselves when they choose to trade real money. Never flip it.
 
 ## What it reads and writes
 
@@ -55,85 +64,77 @@ is a real yes for that order, builds the flatten ticket, and keeps the log in
 | `trader/portfolio.json` | cash and shares, updated by `fill` and by `result --filled-qty` |
 | `trader/plan.json` | the flat-by time for `flatten` |
 
-## Setup A: Alpaca (official MCP server, Claude Desktop)
+## Setup: Zerodha Kite MCP
 
-Alpaca's own server is github.com/alpacahq/alpaca-mcp-server (MIT). It runs on
-the user's computer inside Claude Desktop. It is not in Claude's connector
-directory. It trades on a **paper** account unless told otherwise. Checked
-against its source on 2026-10-20 (version 2.4.0).
+Zerodha's Kite MCP server comes in two forms. Say which one the user has
+before promising anything.
 
-1. The user makes an Alpaca account and creates **paper trading** API keys in
-   the Alpaca dashboard. Paper keys are separate from live keys.
-2. The user installs `uv` (it provides `uvx`), from docs.astral.sh/uv.
-3. In Claude Desktop: Settings > Developer > Edit Config. That opens
-   `claude_desktop_config.json` (macOS: `~/Library/Application Support/Claude/`,
-   Windows: `%APPDATA%\Claude\`). The user adds this block (also in
-   `claude_desktop_config.example.json` here) and types their own keys into the file:
+**A. Hosted, read-only (free, no API key).** `https://mcp.kite.trade/mcp`.
+Zerodha's hosted server only reads: profile, margins, holdings, positions,
+orders, quotes. **It cannot place, modify or cancel regular orders.** It is
+enough for paper mode with real quotes and for checking positions.
 
-```json
-{
-  "mcpServers": {
-    "alpaca": {
-      "command": "uvx",
-      "args": ["alpaca-mcp-server"],
-      "env": {
-        "ALPACA_API_KEY": "paste your paper key here, in this file only",
-        "ALPACA_SECRET_KEY": "paste your paper secret here, in this file only",
-        "ALPACA_PAPER_TRADE": "true",
-        "ALPACA_TOOLSETS": "account,trading,stock-data"
-      }
-    }
-  }
-}
-```
+- Claude Desktop / claude.ai: Customize > Connectors > Add custom connector,
+  URL `https://mcp.kite.trade/mcp`. Or the block in
+  `claude_desktop_config.example.json` here (uses `npx mcp-remote`, needs Node.js).
+- Claude Code: `claude mcp add --transport http kite https://mcp.kite.trade/mcp`
 
-   The `env` block hands the keys to the server as environment variables.
-   **Keys never go in the chat.** Never ask for them, never read this file
-   back into the conversation, and if the user pastes a key anyway, tell them
-   to delete that message and make new keys in the Alpaca dashboard.
-   `ALPACA_PAPER_TRADE` is already true by default; writing it makes it
-   visible. `ALPACA_TOOLSETS` is optional and hides the tools they do not need.
-4. Restart Claude Desktop.
-5. **Set the tool permissions.** Customize > Connectors (Settings > Connectors
-   in older versions), open alpaca, and for each tool pick Always allow, Needs
-   approval or Blocked:
-   - `place_stock_order`: **Needs approval**. Never Always allow.
-   - every other tool that places, changes, cancels or closes anything
-     (`cancel_order_by_id`, `replace_order_by_id`, `close_position`,
-     `update_account_config`): Needs approval.
-   - `place_option_order`, `place_crypto_order`, `close_all_positions`,
-     `cancel_all_orders`, `exercise_options_position`,
-     `do_not_exercise_options_position`: **Blocked** unless the user has a
-     reason and says so.
-   - read-only tools (`get_account_info`, `get_all_positions`, `get_open_position`,
-     `get_orders`, `get_clock`, `get_stock_snapshot`, `get_stock_latest_quote`):
-     Always allow is fine.
-6. Check it: ask Claude for the Alpaca account info (read only) and confirm
-   in the Alpaca dashboard that it is the paper account.
+**B. Self-hosted, with order tools (needed for LIVE orders).** The user runs
+Zerodha's open-source server (github.com/zerodha/kite-mcp-server, Go) on
+their own computer with their own Kite Connect API key:
 
-In Claude Code instead of Claude Desktop, keep the order tool on ask in
-`.claude/settings.json`: `"permissions": {"ask": ["mcp__alpaca__place_stock_order"]}`,
-and never put an order tool in `allow`.
+1. A Zerodha trading account with TOTP 2FA enabled.
+2. Sign up at `developers.kite.trade` and create an app. They get an
+   `api_key` and an `api_secret`. The plans and prices change: tell the user
+   to read the current ones on that page (historically a free personal plan
+   without market data, and a paid Connect plan with live data).
+3. Set the app's redirect URL to the one the server's README gives for local
+   use, build and run the server with `KITE_API_KEY` and `KITE_API_SECRET` in
+   its environment (never in the chat), and add its local URL to Claude.
+4. SEBI's retail algo-trading rules apply to API orders (brokers may require
+   a registered static IP for order placement and limit orders per second).
+   Tell the user to check Zerodha's current requirements before going live.
 
-**Bracket orders on Alpaca.** `place_stock_order` takes
-`take_profit_limit_price` and `stop_loss_stop_price` (and an optional
-`stop_loss_limit_price`). When either is there, the server sets
-`order_class` to "bracket" by itself; trader-budget writes it anyway so the
-ticket shows it. A bracket is whole shares only, with `time_in_force` day or
-gtc. After the entry fills, the stop-loss and the take-profit wait at the
-broker as two orders that cancel each other. They are day orders too, so they
-end at the close: one more reason to be flat by then.
+Either way:
 
-## Setup B: Interactive Brokers (connector in Claude's directory)
+- Log in with the Kite `login` tool: it returns a link; the user logs in **on
+  zerodha.com** with their own password and TOTP. **Never ask for, accept or
+  repeat the user's Kite password, TOTP, PIN, api_secret or access token.** If
+  they paste one, tell them to delete the message and regenerate it. The
+  session expires every morning (around 6 AM IST): log in again each trading day.
+- **Tool permissions** (Customize > Connectors > kite, or Claude Code
+  `"permissions": {"ask": [...]}`): `place_order`, `modify_order`,
+  `cancel_order` and the GTT tools: **Needs approval**, never Always allow.
+  Read-only tools (`get_profile`, `get_margins`, `get_holdings`,
+  `get_positions`, `get_orders`, `get_quotes`, `get_ltp`): Always allow is fine.
+- Check it: `get_profile` and `get_margins`. If `place_order` is not in the
+  tool list, the user is on the hosted read-only server: say so, stay in paper
+  mode, or show the ticket for them to place by hand in the Kite app.
 
-Interactive Brokers publishes a verified connector: claude.ai/directory/interactive-brokers
-(connector URL `https://api.ibkr.com/v1/api/mcp`). Add it from Customize >
-Connectors > Browse connectors and sign in to IBKR there, not in the chat.
-Its listing says Claude can draft trade instructions that are sent to the
-user's IBKR account for their review and approval, and that Claude never
-submits orders directly to the market. So with IBKR the final yes happens in
-IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
-that draft orders to Needs approval too.
+Other brokers (Upstox, Angel One, Groww, Dhan...): set `"broker"` to its name.
+The ticket then shows the order in plain words and the user places it in their
+own broker app; this pack drives only Kite.
+
+## How an intraday trade is sent (no bracket orders in India)
+
+Zerodha discontinued bracket and cover orders, so the plan's three prices go out like this:
+
+1. **Entry**: `place_order` — `variety: regular`, `exchange: NSE`,
+   `transaction_type: BUY`, `product: MIS` (intraday), `order_type: MARKET`
+   (or `LIMIT` with `price`), `quantity`, `validity: DAY`.
+2. **Protective stop, only after the entry FILLED** (check `get_order_history`
+   or `get_positions`): `place_order` — `transaction_type: SELL`,
+   `order_type: SL-M`, `trigger_price` = the plan's stop, same quantity, `MIS`.
+   This is a second order, so it needs its own Allow once; the user's one yes
+   for the ticket covers both legs of THAT ticket, nothing else.
+3. **Target: NOT sent as an order.** Two live sell orders on the same shares
+   can both fill and leave the user short. trader-alerts rings at the target;
+   then cancel the SL-M (`cancel_order`) and square off with a `flatten` ticket.
+
+`product: MIS` positions are auto squared-off by Zerodha from about 3:20 PM
+IST with an extra charge, which is why `flat_by` defaults to 15:15.
+`allow_margin` is false by default, so the size uses the user's own cash, not
+MIS leverage.
 
 ## Steps: the entry
 
@@ -143,70 +144,65 @@ that draft orders to Needs approval too.
    per question. Never offer "yes to all".
 3. Run `ticket.py approve --index N --reply "<the user's reply, word for word>"`.
    If it prints "Not recorded", the reply was not an explicit yes for this
-   order (for example "sure", "yes to all", or a yes that names a different
-   stock or amount). Ask again. Never turn a reply into a yes yourself.
-4. Only after "Recorded your yes", call `place_stock_order` with exactly the
-   JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   order. Ask again. Never turn a reply into a yes yourself.
+4. Paper: `ticket.py fill` at the current price (from `/trader-alerts quote`).
+   Live: call `place_order` with exactly the entry args the ticket printed;
+   Claude's card appears: Allow once or Deny. When it has filled, place the
+   SL-M stop exactly as printed.
 5. Record what happened: `ticket.py result --index N --status placed
-   --broker-id <id> --filled-qty Q --filled-price P` (the fill from the
-   response or `get_open_position`), or `--status denied`, or `--status failed`
-   with `--note`. A failed order is not retried without a new check and a new yes.
-   The log keeps the entry's max loss for trader-risk's daily limit.
+   --broker-id <order_id> --filled-qty Q --filled-price P`, or `--status denied`,
+   or `--status failed` with `--note`. A rejected order (insufficient margin,
+   circuit limit, stock in ban / ASM / trade-for-trade) is not retried without
+   a new check and a new yes.
 
 ## Steps: while it is open, and out by the close
 
 - trader-alerts watches the stop, the target and the flat-by time
-  (`alerts.py add --from-plan`). The bracket's own orders do the stopping.
-- When the stop-loss or the take-profit fills, record it:
-  `ticket.py fill --symbol TSLA --side sell --qty 8 --price 358.32`.
-- By `flat_by` (15:55 New York), anything still open gets closed:
-  1. Ask Alpaca how many shares are held: `get_open_position` (read only).
-  2. `ticket.py flatten --symbol TSLA --qty 8` writes a market sell for those
-     shares to `trader/orders.json`.
+  (`alerts.py add --from-plan`). The SL-M on the exchange does the stopping.
+- When the SL-M fills, record it: `ticket.py fill --symbol ADANIENT --side sell --qty 16 --price 2737.75`.
+- At the target, or by `flat_by` (15:15 IST), close what is still open:
+  1. `get_positions` (read only): the MIS quantity held.
+  2. `ticket.py flatten --symbol ADANIENT --qty 16` writes a MARKET SELL MIS ticket.
   3. `/trader-risk`. A sell that only closes what the user holds is never
      blocked by the daily limits or the entry window.
-  4. `ticket.py show`, then the user's yes for that one order, as above.
-  5. The bracket's stop-loss and take-profit still hold those shares, so
-     Alpaca rejects a new sell until they are canceled: `get_orders` (status
-     open, nested true) shows them; `cancel_order_by_id` each one (Needs
-     approval). Then `place_stock_order` with the ticket, then `result`.
+  4. `ticket.py show`, then the user's yes for that one order.
+  5. `get_orders`, then `cancel_order` the open SL-M (Needs approval) so it
+     cannot also fill. Then `place_order` with the ticket, then `result`.
+  6. `get_positions` again: net quantity must be 0.
 
-## Example: the reel
+## Example
 
 ```
-ORDER 1 of 1, PAPER account, Alpaca
-  BUY 8 TSLA, market, good for today
-  stop-loss 358.32
-  take-profit 370.04
-  max loss about $46.88 if the stop fills at 358.32 (it can fill worse in a fast market)
-  why: opening-range breakout on TSLA: 8 shares, bound by your $50 max loss per trade (8 x 5.86 = $46.88 at the stop)
+ORDER 1 of 1, PAPER account, Zerodha Kite
+  BUY 16 ADANIENT, limit 2768.50, good for today
+  stop-loss 2737.75
+  take-profit 2830.00
+  max loss about ₹492 if the stop fills at 2737.75 (it can fill worse in a fast market)
+  why: opening-range breakout on ADANIENT: 16 shares, bound by your ₹500 max loss per trade (16 x 30.75 = ₹492 at the stop)
   READY: trader-risk PASS, waiting for your yes
-  Claude will call place_stock_order with exactly:
-    {"symbol": "TSLA", "side": "buy", "qty": "8", "type": "market", "time_in_force": "day",
-     "order_class": "bracket", "take_profit_limit_price": "370.04", "stop_loss_stop_price": "358.32"}
+  PAPER: Zerodha has no paper account, so nothing is sent. Record a simulated fill with
+  ticket.py fill once you say yes. These are the calls a LIVE run would make:
+    entry: place_order
+      {"variety": "regular", "exchange": "NSE", "tradingsymbol": "ADANIENT", "quantity": 16,
+       "product": "MIS", "validity": "DAY", "transaction_type": "BUY", "order_type": "LIMIT", "price": 2768.5}
+    after the BUY has filled: protective stop: place_order
+      {"variety": "regular", "exchange": "NSE", "tradingsymbol": "ADANIENT", "quantity": 16,
+       "product": "MIS", "validity": "DAY", "transaction_type": "SELL", "order_type": "SL-M", "trigger_price": 2737.75}
 ```
-
-The user replies "yes". Claude records it, calls `place_stock_order`, and the
-card reads "Claude wants to use Place stock order" with that JSON and two
-buttons: Allow once, Deny. Allow once sends it to the paper account. The
-`why` and the plan stay in the file; they are never sent.
 
 ## What it never does
 
-- Never places an order without all three gates, and never two orders on one yes.
+- Never places an order without all three gates, and never two tickets on one yes.
 - Never places orders from a scheduled or background task: nobody is there to say yes.
-- Never asks for, reads, stores or repeats API keys or passwords.
-- Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
-- Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
-- Never promises a fill price: a market order and a stop fill at whatever the market gives.
+- Never asks for, reads, stores or repeats Kite passwords, TOTP, PIN or API secrets.
+- Never switches `"paper"` to false. The user does that themselves.
+- Never places F&O, currency or commodity orders, CNC delivery trades, or short sells unless the config allows it and the user confirms.
+- Never sends the target as a second live sell order (it could leave the user short).
+- Never promises a fill price: a market order and an SL-M fill at whatever the market gives, and a stock locked at its circuit limit may not fill at all.
 
 ## Safety
 
-- Education and tooling, not financial advice. A PASS is a rules check, not a recommendation.
-- Paper trading by default (`"paper": true`). Going live is the user's own decision, in their own config.
-- Nothing in this pack places an order except trader-broker, and only when all three hold: trader-risk
-  passed that exact order today, the user typed an explicit yes for that one order in the chat, and the
-  user clicked Allow once on Claude's own card because the order tool is set to "Needs approval"
-  (Customize > Connectors > tool permissions). Never set an order tool to "Always allow".
-- No options, margin, short selling or leverage unless the config allows it and the user confirms.
-- Broker keys live in environment variables or the Claude Desktop config, never in the chat.
+- Education and tooling, not investment advice; this pack is not a SEBI-registered investment adviser or research analyst. A PASS is a rules check, not a recommendation.
+- SEBI's July 2023 study found that about 7 in 10 individual intraday traders in the equity cash segment lost money in FY23. Say so if the user is new.
+- Paper by default (`"paper": true`). Going live is the user's own decision, in their own config.
+- No margin (MIS leverage), short selling, F&O or options unless the config allows it and the user confirms.

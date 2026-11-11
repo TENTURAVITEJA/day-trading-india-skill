@@ -32,7 +32,7 @@ keep each loss and each day's losses small. They do not make a trade win.
 python3 "${CLAUDE_SKILL_DIR}/check.py"                           # trader/ files; writes trader/state/risk.json
 python3 "${CLAUDE_SKILL_DIR}/check.py" --json
 python3 "${CLAUDE_SKILL_DIR}/check.py" --no-write                # look without recording
-python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-10-19 10:15"  # pin the clock (New York time)
+python3 "${CLAUDE_SKILL_DIR}/check.py" --now "2026-11-11 10:20"  # pin the clock (IST)
 ```
 
 ## What it reads and writes
@@ -61,20 +61,20 @@ batch that is fine order by order but breaks a limit together is caught.
 
 | check | blocks when |
 | --- | --- |
-| format | no symbol, side not buy or sell, both or neither of qty and notional, a notional order that is not market + day (Alpaca's rule), a limit order with no limit price; a bracket that is not whole shares, not `day` or `gtc`, or misses its stop-loss or take-profit |
-| asset | an option symbol while `allow_options` is false; crypto or anything that is not a US stock or ETF ticker |
+| format | no symbol, side not buy or sell, a limit order with no limit price, a stop-loss / target missing on an entry |
+| india | a rupee (notional) amount or fractional shares (NSE/BSE take whole shares), extended hours (no after-hours session), anything but a DAY order (MIS intraday), a symbol that is not an NSE/BSE trading symbol |
+| asset | an option symbol while `allow_options` is false; crypto, F&O or anything that is not an NSE/BSE cash-market equity |
 | short | a sell of more than you hold (`allow_short` false) |
 | blocked | (entries) the ticker is on the `blocked` list |
-| size | (entries) under `min_order_usd` or over `max_order_usd` |
+| size | (entries) under `min_order_inr` or over `max_order_inr` |
 | position | (entries) the stock would be over `max_position_pct` of the account |
 | cash | (entries) the buy would leave less than the cash buffer, or need margin |
 | stop | (entries) no stop while `require_stop` is true (a bracket `stop_loss_stop_price`, or the order's plan stop); a stop on the wrong side of the entry |
-| loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_usd` |
+| loss | (entries) qty x (entry minus stop) over `max_loss_per_trade_inr` |
 | reward:risk | (entries) (target minus entry) / (entry minus stop) under `min_reward_risk` |
-| daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_usd` |
+| daily loss | (entries) the max losses at the stops of today's entries, plus this one, over `max_daily_loss_inr` |
 | trades | (entries) `max_trades_per_day` entries already placed today |
 | window | (entries) before `no_entries_before` or after `no_entries_after`, or the market is closed |
-| pdt | (entries, only with `pdt_guard` true) 3 day trades already in the last 5 business days |
 | duplicate | (entries) the same symbol and side twice in one batch, or already placed today |
 | daily limit | (entries) `max_orders_per_day` orders already placed today |
 
@@ -86,26 +86,25 @@ How the numbers work:
   understate the risk at 10:55 after the price ran up. An older price is not
   used, and it says so.
 - **Daily loss** counts the full max loss of every entry placed today, win or
-  lose, as trader-broker logged it. Three full-size trades use up a $150 day.
-- **The window** is New York time, worked out in the tool (daylight saving
-  included), never from the computer's clock zone. Weekends and NYSE holidays
-  are closed. On a 1:00 p.m. early close the window ends 3 hours earlier too.
+  lose, as trader-broker logged it. Three full-size trades use up a ₹1,500 day.
+- **The window** is IST, worked out in the tool (UTC+5:30, no daylight saving), never from the computer's clock zone. Weekends and NSE holidays
+  are closed.
   Set both `no_entries_*` to null to switch the window off.
-- **pdt_guard** (off by default) counts a day trade as a symbol bought and
-  sold on the same day in the log, plus any entry placed today (it is meant
-  to be flat by the close). FINRA removed the $25,000 pattern-day-trader
-  minimum (Regulatory Notice 26-10, effective June 4, 2026; firms may phase
-  in until October 20, 2027), so some brokers still apply the old rule: turn
-  `pdt_guard` on if yours does.
+- **No PDT rule in India.** There is no pattern-day-trader minimum. What
+  matters instead: the broker's MIS auto square-off (Zerodha ~3:20 PM), the
+  daily price bands (circuit limits of 2/5/10/20 %), stocks in the F&O ban
+  period, under ASM/GSM surveillance or in the BE (trade-for-trade) series,
+  where intraday is not allowed. If the user mentions one of these, block the
+  entry by adding the symbol to `blocked` for the day.
 
 Warnings do not block, but say them to the user: a LIVE account, a number
 sent as a number instead of a string, a stop that lives only in the plan and
-not at the broker, a price too old to use, an early close today.
+not at the broker, a price too old to use.
 
 ## Steps
 
 1. If the price may have moved since the plan, refresh it first
-   (trader-alerts: `alerts.py quote TSLA --write`).
+   (trader-alerts: `alerts.py quote ADANIENT --write`).
 2. Run `check.py`. Exit code 0 means every order passed, 1 means at least one
    was blocked.
 3. Tell the user the result in plain words, order by order: the max loss at
@@ -117,35 +116,33 @@ not at the broker, a price too old to use, an early close today.
    each order to its verdict by fingerprint, so an edited order is not ready
    until it passes again, and a verdict from yesterday does not count today.
 
-## Example: the reel
+## Example
 
-The TSLA bracket from trader-budget at 10:15 AM on Monday 2026-10-19, on a
-fresh $5,000 paper account with the example config:
+The ADANIENT order from trader-budget at 10:20 AM on Wednesday 2026-11-11
+(real data), on a fresh ₹1,00,000 paper account with the example config:
 
 ```
-PASS  #1 buy TSLA 8 shares, entry
-          entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share
-          max loss $46.88 (limit $50), reward:risk 1.00 (min 1)
-          today before this: 0 of 3 trades, $0 of $150 daily loss
+PASS  #1 buy ADANIENT 16 shares, entry
+          entry 2768.50 (the plan's entry), stop 2737.75, target 2830.00: risk 30.75 a share
+          max loss ₹492 (limit ₹500), reward:risk 2.00 (min 1)
+          today before this: 0 of 3 trades, ₹0 of ₹1,500 daily loss
 
-1 passed, 0 blocked at 2026-10-19 10:15 New York. Cash after the passed orders: $2,086.56 (paper account).
+1 passed, 0 blocked at 2026-11-11 10:20 IST. Cash after the passed orders: ₹55,704 (paper account).
 ```
 
 One more share and it is blocked:
 
 ```
-BLOCK #1 buy TSLA 9 shares, entry
-          entry 364.18 (the plan's entry), stop 358.32, target 370.04: risk 5.86 a share
-          max loss $52.74 (limit $50), reward:risk 1.00 (min 1)
-          today before this: 0 of 3 trades, $0 of $150 daily loss
-        - loss: 9 shares x 5.86 risk a share = $52.74 at the stop, over your $50 max loss per trade
+BLOCK #1 buy ADANIENT 17 shares, entry
+          entry 2768.50 (the plan's entry), stop 2737.75, target 2830.00: risk 30.75 a share
+          max loss ₹522.75 (limit ₹500), reward:risk 2.00 (min 1)
+          today before this: 0 of 3 trades, ₹0 of ₹1,500 daily loss
+        - loss: 17 shares x 30.75 risk a share = ₹522.75 at the stop, over your ₹500 max loss per trade
 ```
 
-The same 8 shares checked at 10:55 with the real 10:52 quote (366.48) in
-`trader/prices.json` are blocked twice: 8 x 8.16 = $65.28 at the stop, and
-reward:risk 0.44. At 9:40 they are blocked by the window (no new entries
-before 9:45). The 3:55 PM sell that closes the position passes, even though
-it is after the 3:30 entry cutoff: it is an exit.
+The same 16 shares checked at 9:20 are blocked by the window ("no new entries
+before 09:30 IST"). The 3:15 PM sell that closes the position passes, even
+though it is after the 14:45 entry cutoff: it is an exit.
 
 ## Rules
 

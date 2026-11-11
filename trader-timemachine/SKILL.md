@@ -2,7 +2,7 @@
 name: trader-timemachine
 description: >-
   Time Machine. Replays every possible outcome of a trade before you risk a
-  dollar: 10,000 simulated sessions plus every past time the setup fired.
+  rupee: 10,000 simulated sessions plus every past time the setup fired.
   Takes the plan from trader-exit (entry, stop, target), rebuilds the rest of
   the day 10,000 times from the stock's own 5-minute bars over the last 60
   days, and re-runs the same rule on every past session. Prints the odds of
@@ -32,16 +32,16 @@ good-looking replay does not change that.
 ```bash
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run                    # trader/plan.json, 10,000 replays, seed 19
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --write            # also save trader/timemachine.json
-python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 15:55      # end each replay at your flat-by time
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --until 15:15      # end each replay at your flat-by time
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --json
-python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol TSLA --date 2026-10-19 \
-    --entry 364.18 --stop 358.32 --target 370.04 --entry-time "10:15 AM"
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol ADANIENT --date 2026-11-11 \
+    --entry 2768.50 --stop 2737.75 --target 2830.00 --entry-time "10:20 AM"
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
 ```
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-10-19 10:15"` (New York time) to pin the clock.
+`--now "2026-11-11 10:20"` (IST) to pin the clock.
 
 ## What it reads and writes
 
@@ -54,7 +54,7 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 ## How it works
 
 1. **The pool.** It keeps only FULL sessions before the plan's date: all 78
-   five-minute bars, 9:30 to 4:00 New York time. Half days, gaps and today
+   five-minute bars, 9:15 to 4:00 IST. Half days, gaps and today
    are left out. Every bar becomes four ratios to the bar before it:
    open, high, low and close over the previous close.
 2. **One replay.** Start at the entry price. For each bar left in the day,
@@ -62,8 +62,8 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
    random, and scale it to the current price. Bar by bar, it checks the stop
    first, then the target. A bar that touches both counts as the stop.
 3. **10,000 replays** give four odds. Target first. Stop first. Neither,
-   which means the trade was still open at `--until` (default 4:00 PM, the
-   close, or 1:00 PM on an NYSE early-close day). Green, which means target
+   which means the trade was still open at `--until` (default 3:15 PM, the
+   flat-by time; Yahoo's NSE data has no reliable bars after that). Green, which means target
    first or above the entry at `--until`.
    R is +1 at a 1R target, -1 at the stop, and otherwise the distance from
    the entry at `--until` divided by the risk. A gap through the stop still
@@ -100,7 +100,7 @@ grid). A live in-progress bar is never used.
 
 1. Make sure `trader/plan.json` is today's plan from `/trader-exit`. If there
    is none, run that first, or pass the plan as flags.
-2. Run `timemachine.py run --write`. Add `--until 15:55` when the plan has a
+2. Run `timemachine.py run --write`. Add `--until 15:15` when the plan has a
    flat-by time, so "neither" means still open at the time you would get out.
 3. Tell the user, in this order: the four odds, the median and the 5 to 95
    range of the price at the close, the average R, the history line, then the
@@ -112,30 +112,32 @@ grid). A live in-progress bar is never used.
    `/trader-news` for the stock before going on.
 6. If the user still wants the trade, hand off to `/trader-budget` to size it.
 
-## Example: the reel
+## Example
 
-TSLA, Monday 2026-10-19. The 15-minute opening range is 354.47 to 362.18.
-The 10:10 bar closes above it: entry 364.18 at 10:15 AM (bar 8), stop 358.32
-(the range midpoint, rounded down), target 370.04 (1R, risk 5.86 a share).
+ADANIENT, Wednesday 2026-11-11 (real data). The 15-minute opening range is
+2,728.80 to 2,746.70. The 10:15 bar closes above it: entry 2,768.50 at 10:20 AM
+(bar 12), stop 2,737.75 (the range midpoint), target 2,830.00 (2R, risk 30.75
+a share).
 
 ```
-10,000 replays of the rest of the session, 10:15 AM to 4:00 PM (69 five-minute bars), seed 19.
-  target first   29.4 %
-  stop first     25.5 %
-  neither        45.1 %   still open at 4:00 PM
-  green          51.7 %   target first, or above the entry at 4:00 PM
-  Price at 4:00 PM: median 364.36, 90 % of replays between 355.54 and 373.54.
-  Average R: +0.034
-History: the same rule on each of those 59 real sessions fired 33 times:
-13 target, 15 stop, 5 neither. Average R -0.062.
-Close to a coin flip: target first 29.4 % vs stop first 25.5 %.
-45.1 % of the replays hit neither by 4:00 PM; the price at 4:00 PM decides those.
+10,000 replays of the rest of the session, 10:20 AM to 3:15 PM (59 five-minute bars), seed 19.
+Each bar is drawn whole from ADANIENT's own 5-min bars at the same time of day (+-2 bars) over its last 58 full sessions (2026-08-14 to 2026-11-09).
+  target first   5.4 %
+  stop first     43.0 %
+  neither        51.6 %   still open at 3:15 PM
+  green          40.1 %   target first, or above the entry at 3:15 PM
+  Price at 3:15 PM: median 2763.29, 90 % of replays between 2703.85 and 2821.67.
+  Average R: -0.141
+History: the same rule on each of those 58 real sessions fired 33 times: 6 target, 16 stop, 11 neither. Average R +0.096.
+Strongly toward the stop: at 2R the target has to come first in 33 % of the replays that hit one side; it did in 11 %.
 ```
 
-At 1R the target has to come first in half of the replays that hit one
-side. It did in 53.6 %. The replays came out close to a coin flip, and the
-real history was slightly worse than even. That is the honest answer for this setup, and it is what
-the user should hear before `/trader-budget` sizes 8 shares.
+At 2R the target has to come first in a third of the replays that hit one
+side; it did in about one in nine. The stop sits only 1.1 % under the entry,
+inside the stock's normal 5-minute noise, while the target is 2.2 % away.
+That is the honest answer for this plan, and it is what the user should hear
+before `/trader-budget` sizes 16 shares. (The real history, 6 targets to 16
+stops, is small and should not be read as an edge.)
 
 ## Rules
 
