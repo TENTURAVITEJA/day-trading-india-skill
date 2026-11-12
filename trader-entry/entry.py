@@ -231,6 +231,10 @@ def plain_symbol(sym):
     return s[:-3] if s.endswith(".NS") else s
 
 
+def _sleep(seconds):
+    time.sleep(seconds)
+
+
 def _unix(ist_dt):
     return int((ist_to_utc(ist_dt) - datetime.datetime(1970, 1, 1)).total_seconds())
 
