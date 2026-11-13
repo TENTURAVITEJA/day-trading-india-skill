@@ -53,7 +53,7 @@ dt{color:var(--mute)} dd{margin:0;text-align:right}
       <thead><tr><th>Symbol</th><th>Last</th><th>Chg</th><th>RSI 14</th><th>vs SMA20</th></tr></thead>
       <tbody id="wl"></tbody>
     </table>
-    <div class="note">RSI and SMA20 are on daily candles. Click a row for its chart.</div>
+    <div class="note">RSI and SMA20 use completed daily closes. The list reloads every 3 minutes. Click a row for its chart.</div>
   </section>
 
   <section>
@@ -71,9 +71,14 @@ dt{color:var(--mute)} dd{margin:0;text-align:right}
 
   <section>
     <h2>Indicator values</h2>
+    <div id="stamp" class="note" style="margin:0 0 8px"></div>
+    <h2 id="h-intra">Today, 5-minute candles</h2>
     <dl id="stats"></dl>
+    <h2 id="h-daily">Daily</h2>
+    <dl id="dstats"></dl>
     <h2>Setups (daily rules)</h2>
     <div id="setups" class="mute">—</div>
+    <div id="setups-note" class="note" style="margin:4px 0 0"></div>
     <h2 style="margin-top:14px">Trade plan</h2>
     <dl id="plan"><dt class="mute">No plan for today</dt><dd></dd></dl>
     <h2>Time Machine odds</h2>
@@ -134,24 +139,51 @@ async function loadChart() {
     lineB.applyOptions({color: c("--ema"), title: "EMA20"}); lineB.setData(d.lines.ema20);
     if (d.opening_range) { hline(d.opening_range.high, c("--or"), "OR high"); hline(d.opening_range.low, c("--or"), "OR low"); }
     $("legend").innerHTML = `<span><i style="background:${c("--vwap")}"></i>VWAP</span><span><i style="background:${c("--ema")}"></i>EMA 20</span><span><i style="background:${c("--or")}"></i>Opening range (first 15 min)</span><span>Session ${d.session}</span>`;
-    stats([["Last (5-min close)", fmt(s.last)], ["Prev close", fmt(s.prev_close)], ["Day high", fmt(s.day_high)], ["Day low", fmt(s.day_low)],
-      ["VWAP", fmt(s.vwap)], ["EMA 20 (5-min)", fmt(s.ema20)], ["RSI 14 (5-min)", fmt(s.rsi, 1)],
-      ["OR high", fmt(d.opening_range && d.opening_range.high)], ["OR low", fmt(d.opening_range && d.opening_range.low)],
-      ["Volume", fmt(s.volume, 0)], ["Last bar", s.last_bar]]);
+    intraday(d);
+    loadDaily(current);
   } else {
     lineA.applyOptions({color: c("--ema"), title: "SMA20"}); lineA.setData(d.lines.sma20);
     lineB.applyOptions({color: c("--sma50"), title: "SMA50"}); lineB.setData(d.lines.sma50);
     hline(d.high20, c("--or"), "20-day closing high");
-    $("legend").innerHTML = `<span><i style="background:${c("--ema")}"></i>SMA 20</span><span><i style="background:${c("--sma50")}"></i>SMA 50</span><span><i style="background:${c("--or")}"></i>Highest close of the prior 20 days</span>`;
-    stats([["Last close", fmt(s.last)], ["Prev close", fmt(s.prev_close)], ["SMA 20", fmt(s.sma20)], ["SMA 50", fmt(s.sma50)],
-      ["RSI 14 (daily)", fmt(s.rsi, 1)], ["20-day closing high", fmt(s.high20)], ["Last candle", s.last_bar]]);
+    $("legend").innerHTML = `<span><i style="background:${c("--ema")}"></i>SMA 20</span><span><i style="background:${c("--sma50")}"></i>SMA 50</span><span><i style="background:${c("--or")}"></i>Highest close of the last 20 completed days</span>`;
+    daily(d);
+    loadIntraday(current);
   }
-  $("setups").innerHTML = (d.setups || []).length ? d.setups.map(x => `<span class="tag">${x.label}</span>`).join(" ")
-    : (tf === "1d" ? "No daily rule matched" : "Switch to Daily to see them");
   rsiLine.setData(d.rsi);
   main.timeScale().fitContent(); rsiChart.timeScale().fitContent();
 }
-function stats(pairs) { $("stats").innerHTML = pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join(""); }
+const rowsHtml = (pairs) => pairs.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+const dayLabel = (iso) => { const [y, m, dd] = iso.split("-"); return `${+dd} ${["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][m - 1]}`; };
+function intraday(d) {
+  const s = d.stats, or = d.opening_range;
+  $("h-intra").textContent = `${dayLabel(d.session)}, 5-minute candles`;
+  $("stamp").textContent = `${d.symbol} · ${dayLabel(d.session)} · latest candle ${s.last_bar}–${s.bar_closes} IST${s.bar_forming ? " (still forming)" : ""} · refreshed ${new Date().toLocaleTimeString("en-IN", {hour12: false})}`;
+  $("stats").innerHTML = rowsHtml([["Last", fmt(s.last)], ["Prev close", fmt(s.prev_close)], ["Day high", fmt(s.day_high)], ["Day low", fmt(s.day_low)],
+    ["VWAP", fmt(s.vwap)], ["Last vs VWAP", s.vwap ? `<span class="${pctCls(s.last - s.vwap)}">${((s.last / s.vwap - 1) * 100).toFixed(2)}%</span>` : "—"],
+    ["EMA 20 (5-min)", fmt(s.ema20)], ["RSI 14 (5-min)", fmt(s.rsi, 1)],
+    ["OR high", fmt(or && or.high)], ["OR low", fmt(or && or.low)],
+    ["Last vs OR high", or ? `<span class="${pctCls(s.last - or.high)}">${((s.last / or.high - 1) * 100).toFixed(2)}%</span>` : "—"],
+    ["Volume today", fmt(s.volume, 0)]]);
+}
+function daily(d) {
+  const s = d.stats;
+  $("h-daily").textContent = `Daily, closes through ${dayLabel(s.as_of)}`;
+  const pairs = [["Close", fmt(s.last)], ["SMA 20", fmt(s.sma20)], ["SMA 50", fmt(s.sma50)],
+    ["RSI 14 (daily)", fmt(s.rsi, 1)], ["20-day closing high", fmt(s.high20)]];
+  if (s.today) pairs.push([`Today so far (${dayLabel(s.today.date)})`, fmt(s.today.last)],
+    ["Today vs 20-day high", s.high20 ? `<span class="${pctCls(s.today.last - s.high20)}">${((s.today.last / s.high20 - 1) * 100).toFixed(2)}%</span>` : "—"]);
+  $("dstats").innerHTML = rowsHtml(pairs);
+  $("setups").innerHTML = (d.setups || []).length ? d.setups.map(x => `<span class="tag">${x.label}</span>`).join(" ") : "No daily rule matched";
+  $("setups-note").textContent = `From completed sessions through ${dayLabel(s.as_of)}` + (s.today_forming ? "; today's candle counts after 3:30 PM." : ".");
+}
+async function loadDaily(sym) {
+  try { const d = await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=1d`); if (sym === current) daily(d); }
+  catch (e) { $("dstats").innerHTML = ""; $("setups").textContent = "—"; }
+}
+async function loadIntraday(sym) {
+  try { const d = await api(`/api/chart?symbol=${encodeURIComponent(sym)}&tf=5m`); if (sym === current) intraday(d); }
+  catch (e) { $("stats").innerHTML = ""; }
+}
 
 // ---------- watchlist
 async function loadWatchlist() {
@@ -160,7 +192,7 @@ async function loadWatchlist() {
   $("asof").textContent = w.from_scan ? `watchlist: ${w.mode || ""} scan, ${w.as_of || ""}` : "no scan yet: default list";
   $("wl").innerHTML = rows.map(r => `<tr class="row" data-s="${r.symbol}"><td>${r.symbol}<br>${(r.tags || []).map(t => `<span class="tag">${t.label}</span>`).join("")}</td>
     <td id="l-${r.symbol}">…</td><td id="p-${r.symbol}">…</td><td id="r-${r.symbol}" class="mute">…</td><td id="m-${r.symbol}" class="mute">…</td></tr>`).join("");
-  document.querySelectorAll("tr.row").forEach(tr => tr.onclick = () => select(tr.dataset.s));
+  document.querySelectorAll("tr.row").forEach(tr => { tr.onclick = () => select(tr.dataset.s); tr.classList.toggle("sel", tr.dataset.s === current); });
   if (!current && rows.length) select(rows[0].symbol);
   loadQuotes();
   for (const r of rows) {        // one at a time: Kite allows ~3 historical requests a second
@@ -216,21 +248,26 @@ async function loadTrade() {
     const t = await api("/api/trade");
     if (t.plan) {
       const p = t.plan;
-      $("plan").innerHTML = [["Symbol", p.symbol + (p.stale ? " (old plan " + p.date + ")" : "")], ["Entry", fmt(p.entry)], ["Stop", fmt(p.stop)],
+      $("plan").innerHTML = p.stale
+        ? `<dt class="mute">No plan for today</dt><dd></dd><dt class="mute">Last plan</dt><dd class="mute">${p.symbol}, ${dayLabel(p.date)}</dd>`
+        : [["Symbol", p.symbol], ["Entry", fmt(p.entry)], ["Stop", fmt(p.stop)],
         ["Target", fmt(p.target)], ["Risk / share", fmt(p.risk_per_share)], ["Reward:risk", fmt(p.reward_risk, 1)], ["Flat by", p.flat_by]]
         .map(([k, v]) => `<dt>${k}</dt><dd>${v ?? "—"}</dd>`).join("");
     }
-    if (t.odds) {
+    if (!t.odds || !t.plan || t.plan.stale) {
+      $("odds").innerHTML = `<dt class="mute">Not run today</dt><dd></dd>`;
+    } else {
       const o = t.odds, pc = (x) => x == null ? "—" : (x * 100).toFixed(1) + "%";
-      $("odds").innerHTML = [["Target first", pc(o.p_target)], ["Stop first", pc(o.p_stop)], ["Neither", pc(o.p_neither)],
-        ["Average R", fmt(o.avg_R, 3)], ["Replays", fmt(o.replays, 0)]].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+      $("odds").innerHTML = [["For", t.plan.symbol + " plan"], ["Target first", pc(o.p_target)], ["Stop first", pc(o.p_stop)], ["Neither", pc(o.p_neither)],
+        ["Average R after charges", fmt(o.avg_R, 3)], ["Replays", fmt(o.replays, 0)]].map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
     }
   } catch (e) {}
 }
 
 loadStatus(); loadTrade(); loadWatchlist().catch(e => $("err").textContent = e.message);
 setInterval(loadQuotes, 15000);
-setInterval(() => { if (tf === "5m") loadChart(); }, 60000);
+setInterval(() => { if (tf === "5m") loadChart(); else loadIntraday(current); }, 60000);
+setInterval(() => loadWatchlist().catch(() => {}), 180000);
 setInterval(() => { loadStatus(); loadTrade(); }, 30000);
 </script>
 </body>

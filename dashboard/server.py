@@ -194,14 +194,22 @@ def chart(sym, tf):
             "stats": {"last": r2(last["c"]), "prev_close": r2(prev[-1]["c"]) if prev else None,
                       "day_high": r2(max(b["h"] for b in today)), "day_low": r2(min(b["l"] for b in today)),
                       "volume": sum(b["v"] for b in today), "vwap": r2(vwap[idx[-1]]), "ema20": r2(e20[-1]),
-                      "rsi": r2(rsi[-1]), "last_bar": last["dt"].strftime("%H:%M")},
+                      "rsi": r2(rsi[-1]), "last_bar": last["dt"].strftime("%H:%M"),
+                      "bar_closes": (last["dt"] + datetime.timedelta(minutes=5)).strftime("%H:%M"),
+                      "bar_forming": (datetime.datetime.utcnow() + IST) < last["dt"] + datetime.timedelta(minutes=5)},
         })
     else:
         s20, s50 = sma(closes, 20), sma(closes, 50)
         keep = range(max(0, len(bars) - 130), len(bars))
-        hi20 = max(closes[-21:-1]) if len(closes) > 21 else None
+        # Today's daily candle is still forming until 3:30 PM: the indicator VALUES and the
+        # setups use completed sessions only (what trader-scanner does); the chart shows it.
+        now = datetime.datetime.utcnow() + IST
+        partial = bars[-1]["dt"].date() == now.date() and now.time() < datetime.time(15, 30)
+        k = len(bars) - 2 if partial and len(bars) > 1 else len(bars) - 1      # the last completed session
+        done = closes[:k + 1]
+        hi20 = max(done[-20:]) if len(done) >= 20 else None                    # the close today has to beat
         try:
-            setups = scan.find_setups(closes)[0]
+            setups = scan.find_setups(done)[0]
         except Exception:
             setups = []
         out.update({
@@ -214,9 +222,12 @@ def chart(sym, tf):
             "rsi": [{"time": bars[i]["dt"].strftime("%Y-%m-%d"), "value": r2(rsi[i])} for i in keep if rsi[i] is not None],
             "high20": r2(hi20),
             "setups": _setup_names(setups),
-            "stats": {"last": r2(closes[-1]), "prev_close": r2(closes[-2]) if len(closes) > 1 else None,
-                      "sma20": r2(s20[-1]), "sma50": r2(s50[-1]), "rsi": r2(rsi[-1]), "high20": r2(hi20),
-                      "last_bar": bars[-1]["dt"].strftime("%d %b")},
+            "stats": {"last": r2(closes[k]), "prev_close": r2(closes[k - 1]) if k > 0 else None,
+                      "sma20": r2(s20[k]), "sma50": r2(s50[k]), "rsi": r2(rsi[k]), "high20": r2(hi20),
+                      "last_bar": bars[k]["dt"].strftime("%d %b"), "as_of": bars[k]["dt"].strftime("%Y-%m-%d"),
+                      "today_forming": bool(partial),
+                      "today": {"date": bars[-1]["dt"].strftime("%Y-%m-%d"), "last": r2(closes[-1]),
+                                "high": r2(bars[-1]["h"]), "low": r2(bars[-1]["l"]), "volume": bars[-1]["v"]} if partial else None},
         })
     return out
 
@@ -239,6 +250,8 @@ def daily_summary(sym):
     def work():
         c = chart(sym, "1d")
         return {"symbol": c["symbol"], "rsi": c["stats"]["rsi"], "setups": c["setups"], "sma20": c["stats"]["sma20"],
+                "sma50": c["stats"]["sma50"], "high20": c["stats"]["high20"], "last": c["stats"]["last"],
+                "as_of": c["stats"]["as_of"],
                 "source": c["source"]}
     return cached(("daily", plain(sym)), 900, work)
 
